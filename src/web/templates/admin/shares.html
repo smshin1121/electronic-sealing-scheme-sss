@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}키 조각 관리 - 관리자{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-10">
+        <h3 class="mb-4">관리자 키 조각 (키 조각 4) 목록</h3>
+
+        <a href="{{ url_for('admin.emergency_recover') }}" class="btn btn-danger mb-3">
+            비상 복구
+        </a>
+
+        {% if shares %}
+        <div class="table-responsive">
+            <table class="table table-bordered table-hover">
+                <caption class="visually-hidden">사건별 관리자 키 조각(키 조각 4) 목록</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">봉인 ID</th>
+                        <th scope="col">조각 번호</th>
+                        <th scope="col">업로드 주체</th>
+                        <th scope="col">업로드 시각</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for share in shares %}
+                    <tr>
+                        <td>{{ share.seal_id }}</td>
+                        <td>{{ share.share_index }}</td>
+                        <td>{{ share.uploaded_by }}</td>
+                        <td>{{ share.uploaded_at }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="alert alert-info" role="alert">
+            등록된 관리자 키 조각이 없습니다.
+            봉인 절차에서 키 조각 4가 배분되면 이 목록에 표시됩니다.
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}비상 복구 결과 - 관리자{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h3 class="mb-4">비상 복구 완료</h3>
+
+        <div class="card">
+            <div class="card-header">봉인 ID: {{ seal_id }}</div>
+            <div class="card-body">
+                <p><strong>복구 사유:</strong> {{ reason }}</p>
+                <hr>
+                <p class="fw-bold">복원된 AES 키:</p>
+                <div class="key-display" id="key-value">{{ recovered_key }}</div>
+
+                <div class="mt-3">
+                    <button class="btn btn-outline-primary" onclick="copyKey()">
+                        클립보드에 복사
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="security-warning">
+            <h6>보안 주의사항</h6>
+            <ul>
+                <li>비상 복구 이력은 시스템에 기록됩니다.</li>
+                <li>복원된 키 사용 후 <strong>반드시 클립보드를 정리</strong>해 주세요.</li>
+                <li>키 값을 이메일, 메신저 등으로 전송하지 마세요.</li>
+            </ul>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function copyKey() {
+    const keyText = document.getElementById('key-value').textContent;
+    navigator.clipboard.writeText(keyText).then(function() {
+        alert('키가 클립보드에 복사되었습니다.\n사용 후 반드시 클립보드를 정리해 주세요.');
+    });
+}
+</script>
+{% endblock %}

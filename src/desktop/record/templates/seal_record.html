@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>전자봉인지</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 25mm 20mm;
+        }
+        body {
+            font-family: 'MalgunGothic';
+            font-size: 10pt;
+            line-height: 1.5;
+            color: #000;
+        }
+        h1 {
+            font-family: 'MalgunGothic';
+            font-size: 22pt;
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+        h1 + hr {
+            border: none;
+            border-top: 3px solid #2962FF;
+            margin-bottom: 24px;
+        }
+        h2 {
+            font-family: 'MalgunGothic';
+            font-size: 16pt;
+            font-weight: bold;
+            margin-top: 28px;
+            margin-bottom: 12px;
+        }
+        h3 {
+            font-family: 'MalgunGothic';
+            font-size: 13pt;
+            font-weight: bold;
+            margin-top: 20px;
+            margin-bottom: 8px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 12px;
+        }
+        th, td {
+            font-family: 'MalgunGothic';
+            border: 1px solid #ccc;
+            padding: 8px 12px;
+            text-align: left;
+            vertical-align: top;
+            font-size: 10pt;
+        }
+        th {
+            background-color: #fff;
+            width: 30%;
+            font-weight: normal;
+        }
+        td {
+            width: 70%;
+        }
+        .section-header td {
+            background-color: #e8e8e8;
+            text-align: center;
+            font-weight: bold;
+            font-size: 10pt;
+            padding: 6px;
+        }
+        .hash-val {
+            font-size: 8.5pt;
+            word-break: break-all;
+        }
+        .history-header th {
+            background-color: #bbb;
+            text-align: center;
+            font-weight: bold;
+        }
+        .footer {
+            margin-top: 40px;
+            text-align: center;
+            font-size: 8pt;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+
+<h1>전자봉인지</h1>
+<hr>
+
+<!-- ===== 압수(제출) 정보 ===== -->
+<h2>압수(제출) 정보</h2>
+<table>
+    <tr><th>사건 ID</th><td>{{ record.case_info.case_number }}</td></tr>
+    <tr><th>피압수자</th><td>{{ record.case_info.suspect }}</td></tr>
+    <tr><th>제조사 모델명 S/N</th><td>{{ record.case_info.storage_info.manufacturer }} {{ record.case_info.storage_info.model }} {{ record.case_info.storage_info.serial }}</td></tr>
+    <tr><th>사용자</th><td>{{ record.case_info.device_user }}</td></tr>
+    <tr><th>수사관(압수자)</th><td>{{ record.case_info.investigator }}</td></tr>
+    <tr><th>압수(제출)장소</th><td>{{ record.case_info.seizure_location }}</td></tr>
+    <tr><th>압수(제출)일시</th><td>{{ record.case_info.seizure_time }}</td></tr>
+</table>
+
+<!-- ===== 현재 절차 정보 (봉인) ===== -->
+<h2>현재 절차 정보 (봉인)</h2>
+<table>
+    <tr><th>봉인 ID</th><td>{{ record.seal_id }}</td></tr>
+    <tr><th>봉인 방식</th><td>{{ record.seal_mode | default('standard') }}{% if record.seal_mode == 'strict' %} (소유자 조각 필수){% endif %}</td></tr>
+    <tr><th>열람 제한 해제 시각</th><td>{{ record.unlock_time_iso | default('(미기록)') }}</td></tr>
+    <tr><th>복구키 확인값 (SHA-256)</th><td style="word-break:break-all;font-family:monospace;font-size:9pt">{{ record.key_commitment | default('(미기록)') }}</td></tr>
+    <tr><th>절차 유형</th><td>{{ record.process_info.type }}</td></tr>
+    <tr><th>암호화 알고리즘</th><td>AES-256-GCM</td></tr>
+    <tr><th>암호화 시작</th><td>{{ record.process_info.start_time }}</td></tr>
+    <tr><th>암호화 종료</th><td>{{ record.process_info.end_time }}</td></tr>
+    <tr><th>파일 개수</th><td>{{ record.process_info.file_count }}</td></tr>
+    <tr>
+        <th>파일 목록</th>
+        <td>
+            {% for f in record.file_info.original_files %}
+            &bull; {{ f.filename }}<br>
+            {% endfor %}
+        </td>
+    </tr>
+</table>
+
+<!-- ===== 파일 상세 정보 ===== -->
+<h2>파일 상세 정보</h2>
+
+{% for i in range(record.file_info.original_files | length) %}
+{% set ori = record.file_info.original_files[i] %}
+{% set enc = record.file_info.result_files[i] if i < (record.file_info.result_files | length) else none %}
+
+<h3>파일 {{ i + 1 }}</h3>
+<table>
+    <tr><th>암호화 완료 시각</th><td>{{ enc.enc_ended_time if enc else '' }}</td></tr>
+
+    <!-- 원본 파일 정보 -->
+    <tr class="section-header"><td colspan="2">원본 파일 정보</td></tr>
+    <tr><th>파일명</th><td>{{ ori.filename }}</td></tr>
+    <tr><th>크기</th><td>{{ "{:,}".format(ori.size) }} bytes ({{ "%.3f"|format(ori.size / (1024**3)) }} GB)</td></tr>
+    <tr><th>수정일시</th><td>{{ ori.mtime }}</td></tr>
+    <tr><th>생성일시</th><td>{{ ori.ctime }}</td></tr>
+    <tr><th>접근일시</th><td>{{ ori.atime }}</td></tr>
+    <tr><th>해시값(MD5)</th><td class="hash-val">{{ ori.md5 }}</td></tr>
+    <tr><th>해시값(SHA256)</th><td class="hash-val">{{ ori.sha256 }}</td></tr>
+
+    {% if enc %}
+    <!-- 암호화 파일 정보 -->
+    <tr class="section-header"><td colspan="2">암호화 파일 정보</td></tr>
+    <tr><th>파일명</th><td>{{ enc.filename }}</td></tr>
+    <tr><th>크기</th><td>{{ "{:,}".format(enc.size) }} bytes ({{ "%.3f"|format(enc.size / (1024**3)) }} GB)</td></tr>
+    <tr><th>암호화 알고리즘</th><td>{{ enc.encryption_algo }}</td></tr>
+    <tr><th>구간 수</th><td>{{ enc.nonces | length }}</td></tr>
+    {% endif %}
+</table>
+{% endfor %}
+
+<!-- ===== 서명자 정보 ===== -->
+<h2>서명자 정보</h2>
+<table>
+    <tr><th>성명</th><td>{{ record.signer_info.name }}</td></tr>
+    <tr><th>이메일</th><td>{{ record.signer_info.email }}</td></tr>
+    <tr><th>생년월일</th><td>{{ record.signer_info.birth_date }}</td></tr>
+    <tr><th>연락처</th><td>{{ record.signer_info.phone }}</td></tr>
+</table>
+
+<!-- ===== 봉인 이력 정보 ===== -->
+<h2>봉인 이력 정보</h2>
+<table>
+    <tr><th>요약</th><td>{{ record.history.summary }}</td></tr>
+</table>
+
+<table>
+    <tr class="history-header">
+        <th style="width:8%">ID</th>
+        <th style="width:14%">절차 유형</th>
+        <th style="width:28%">시작 시각</th>
+        <th style="width:28%">종료 시각</th>
+        <th style="width:22%">담당 수사관</th>
+    </tr>
+    {% for ev in record.history.events %}
+    <tr>
+        <td style="text-align:center">{{ ev.id }}</td>
+        <td style="text-align:center">{{ ev.seal_type }}</td>
+        <td>{{ ev.start_time }}</td>
+        <td>{{ ev.end_time }}</td>
+        <td style="text-align:center">{{ ev.investigator }}</td>
+    </tr>
+    {% endfor %}
+</table>
+
+<div class="footer">
+    본 문서는 디지털증거 전자봉인시스템에 의해 자동 생성되었습니다.
+</div>
+
+</body>
+</html>

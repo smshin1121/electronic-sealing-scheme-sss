@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}봉인 기록지 열람 - 피압수자{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-10">
+        <h3 class="mb-4">봉인 기록지 열람</h3>
+        <p class="text-muted">봉인 ID: <strong>{{ seal_id }}</strong></p>
+
+        {% if records %}
+        <div class="table-responsive">
+            <table class="table table-bordered table-hover">
+                <caption class="visually-hidden">봉인 ID {{ seal_id }}의 봉인·봉인해제·재봉인 기록 목록</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">이벤트 번호</th>
+                        <th scope="col">유형</th>
+                        <th scope="col">동기화 시각</th>
+                        <th scope="col">상세</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rec in records %}
+                    <tr>
+                        <td>{{ rec.event_id }}</td>
+                        <td>
+                            {% if rec.event_type == 'Sealing' %}
+                                <span class="badge bg-primary">봉인</span>
+                            {% elif rec.event_type == 'Unsealing' %}
+                                <span class="badge bg-warning text-dark">봉인해제</span>
+                            {% elif rec.event_type == 'Resealing' %}
+                                <span class="badge bg-success">재봉인</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ rec.synced_at }}</td>
+                        <td>
+                            <button class="btn btn-sm btn-outline-secondary"
+                                    onclick="showRecord({{ loop.index0 }}, {{ rec.event_id }})">
+                                기록지 보기
+                            </button>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        {% for rec in records %}
+        <div class="modal fade" id="recordModal{{ loop.index0 }}" tabindex="-1"
+             aria-labelledby="recordModalLabel{{ loop.index0 }}" aria-hidden="true">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="recordModalLabel{{ loop.index0 }}">
+                            봉인 기록 - 이벤트 {{ rec.event_id }} ({{ rec.event_type }})
+                        </h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"
+                                aria-label="닫기"></button>
+                    </div>
+                    <div class="modal-body">
+                        <pre class="bg-light p-3" style="max-height:60vh;overflow:auto;"
+                             id="recordBody{{ loop.index0 }}"
+                             data-loaded="false">기록을 불러오는 중...</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="alert alert-info" role="alert">
+            아직 동기화된 봉인 기록이 없습니다.
+            데스크톱 봉인시스템에서 봉인 절차가 완료되면 기록이 자동으로 동기화됩니다.
+            잠시 후 새로고침해 주세요.
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+// 상세 기록(JSON)은 모달을 열 때 필요한 것만 가져온다 (목록 응답 경량화)
+function showRecord(index, eventId) {
+    const modal = new bootstrap.Modal(document.getElementById('recordModal' + index));
+    modal.show();
+
+    const body = document.getElementById('recordBody' + index);
+    if (!body || body.dataset.loaded === 'true') return;
+
+    fetch('/suspect/records/{{ seal_id }}/detail/' + eventId, {
+        headers: { 'Accept': 'application/json' }
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (data.success) {
+            body.textContent = data.record_json;
+            body.dataset.loaded = 'true';
+        } else {
+            body.textContent = data.message || '기록을 불러오지 못했습니다.';
+        }
+    })
+    .catch(function() {
+        body.textContent = '기록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.';
+    });
+}
+</script>
+{% endblock %}

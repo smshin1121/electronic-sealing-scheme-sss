@@ -1,0 +1,20 @@
+ttkbootstrap>=1.10
+cryptography>=44.0
+asn1crypto>=1.5
+requests>=2.32
+psutil>=6.0
+Pillow>=10.0
+reportlab>=4.0
+# SSS (Shamir 2-of-4): `secretsharing` is VENDORED at src/desktop/crypto/_vendor/secretsharing
+# because the PyPI 0.2.6 release is Python-2-only (import fails on py3 with NameError: long).
+# See the vendored README. Only its runtime dependency stays on pip:
+utilitybelt==0.2.6
+pyHanko>=0.26
+weasyprint>=65.0
+Jinja2>=3.1
+Flask>=3.1
+mariadb
+PyMySQL>=1.1
+pyotp>=2.9
+pytest
+pytest-cov

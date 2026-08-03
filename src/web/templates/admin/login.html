@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}관리자 로그인{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-5">
+        <h3 class="mb-4 text-center">관리자 로그인</h3>
+        <form method="POST" action="{{ url_for('admin.login') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="mb-3">
+                <label for="password" class="form-label required">관리자 비밀번호</label>
+                <input type="password" class="form-control" id="password" name="password" required>
+            </div>
+            <button type="submit" class="btn btn-dark w-100">로그인</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

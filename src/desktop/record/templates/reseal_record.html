@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>디지털증거 재봉인기록지</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 20mm 15mm;
+        }
+        body {
+            font-family: 'Malgun Gothic', 'NanumGothic', sans-serif;
+            font-size: 10pt;
+            line-height: 1.6;
+            color: #000;
+        }
+        h1 {
+            text-align: center;
+            font-size: 18pt;
+            border-bottom: 3px double #000;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        h2 {
+            font-size: 13pt;
+            border-bottom: 1px solid #333;
+            padding-bottom: 4px;
+            margin-top: 18px;
+            margin-bottom: 10px;
+        }
+        h3 {
+            font-size: 11pt;
+            margin-top: 14px;
+            margin-bottom: 8px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 14px;
+        }
+        th, td {
+            border: 1px solid #444;
+            padding: 5px 8px;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background-color: #f0f0f0;
+            width: 25%;
+            font-weight: bold;
+        }
+        .seal-id {
+            text-align: center;
+            font-size: 12pt;
+            font-weight: bold;
+            margin-bottom: 16px;
+            color: #333;
+        }
+        .file-table th {
+            width: 20%;
+        }
+        .file-table td.hash {
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 8pt;
+            word-break: break-all;
+        }
+        .history-event {
+            margin-bottom: 6px;
+            padding: 4px 8px;
+            background-color: #fafafa;
+            border-left: 3px solid #666;
+        }
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            font-size: 9pt;
+            color: #666;
+        }
+        .reason-box {
+            background-color: #fffff0;
+            border: 1px solid #ccc;
+            padding: 8px 12px;
+            margin-bottom: 14px;
+        }
+        .unknown-section {
+            background-color: #fff8f0;
+            border: 1px solid #e0c080;
+            padding: 10px;
+            margin-bottom: 14px;
+        }
+        .derived-section {
+            background-color: #f0f8ff;
+            border: 1px solid #80b0e0;
+            padding: 10px;
+            margin-bottom: 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>디지털증거 재봉인기록지</h1>
+    <div class="seal-id">봉인 ID: {{ record.seal_id }}</div>
+
+    <!-- 사건정보 -->
+    <h2>1. 사건 정보</h2>
+    <table>
+        <tr><th>사건번호</th><td>{{ record.case_info.case_number }}</td></tr>
+        <tr><th>담당 수사관</th><td>{{ record.case_info.investigator }}</td></tr>
+        <tr><th>기기 사용자</th><td>{{ record.case_info.device_user }}</td></tr>
+        <tr><th>피압수자</th><td>{{ record.case_info.suspect }}</td></tr>
+        <tr><th>저장매체 종류</th><td>{{ record.case_info.storage_type }}</td></tr>
+        <tr><th>저장매체 S/N</th><td>{{ record.case_info.storage_info.serial }}</td></tr>
+        <tr><th>압수 일시</th><td>{{ record.case_info.seizure_time }}</td></tr>
+        <tr><th>압수 장소</th><td>{{ record.case_info.seizure_location }}</td></tr>
+    </table>
+
+    <!-- 재봉인 절차정보 -->
+    <h2>2. 재봉인 절차 정보</h2>
+    <table>
+        <tr><th>절차 유형</th><td>{{ record.process_info.type }}</td></tr>
+        <tr><th>시작 시간</th><td>{{ record.process_info.start_time }}</td></tr>
+        <tr><th>종료 시간</th><td>{{ record.process_info.end_time }}</td></tr>
+        <tr><th>처리 파일 수</th><td>{{ record.process_info.file_count }}개</td></tr>
+        <tr><th>절차 담당자</th><td>{{ record.process_info.investigator }}</td></tr>
+        <tr><th>피압수자 참여</th><td>{{ record.process_info.participation }}</td></tr>
+    </table>
+
+    {% if record.process_info.reason %}
+    <div class="reason-box">
+        <strong>재봉인 사유:</strong> {{ record.process_info.reason }}
+    </div>
+    {% endif %}
+
+    <!-- 원본 파일 정보 -->
+    <h2>3. 원본 파일 정보</h2>
+    <table class="file-table">
+        <thead>
+            <tr>
+                <th>파일명</th>
+                <th>크기 (bytes)</th>
+                <th>SHA-256</th>
+                <th>MD5</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for f in record.file_info.original_files %}
+            <tr>
+                <td>{{ f.filename }}</td>
+                <td>{{ f.size }}</td>
+                <td class="hash">{{ f.sha256 }}</td>
+                <td class="hash">{{ f.md5 }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <p>해시 일치 여부: <strong>{{ "일치" if record.file_info.hash_match else "불일치" }}</strong></p>
+
+    <!-- Unknown 파일 -->
+    {% if record.file_info.unknown_files %}
+    <h2>4. Unknown 파일 (이전 기록에 없는 파일)</h2>
+    <div class="unknown-section">
+        <p>아래 파일은 이전 봉인 기록에 존재하지 않는 새로운 파일입니다.</p>
+        <table class="file-table">
+            <thead>
+                <tr>
+                    <th>파일명</th>
+                    <th>크기 (bytes)</th>
+                    <th>SHA-256</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for f in record.file_info.unknown_files %}
+                <tr>
+                    <td>{{ f.filename }}</td>
+                    <td>{{ f.size }}</td>
+                    <td class="hash">{{ f.sha256 }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    <!-- 파생 파일 -->
+    {% if record.file_info.derived_files %}
+    <h2>5. 파생 파일</h2>
+    <div class="derived-section">
+        <p>아래 파일은 원본 파일로부터 분석 과정에서 생성된 파생 파일입니다.</p>
+        <table class="file-table">
+            <thead>
+                <tr>
+                    <th>파일명</th>
+                    <th>크기 (bytes)</th>
+                    <th>원본 파일</th>
+                    <th>파생 사유</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for f in record.file_info.derived_files %}
+                <tr>
+                    <td>{{ f.filename }}</td>
+                    <td>{{ f.size }}</td>
+                    <td>{{ f.parent_file }}</td>
+                    <td>{{ f.derivation_reason }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    <!-- 암호화 결과 파일 -->
+    <h2>{{ "6" if record.file_info.derived_files else ("5" if record.file_info.unknown_files else "4") }}. 재암호화 결과 파일</h2>
+    <table class="file-table">
+        <thead>
+            <tr>
+                <th>파일명</th>
+                <th>크기 (bytes)</th>
+                <th>암호화 알고리즘</th>
+                <th>구간 수</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for f in record.file_info.result_files %}
+            <tr>
+                <td>{{ f.filename }}</td>
+                <td>{{ f.size }}</td>
+                <td>{{ f.encryption_algo }}</td>
+                <td>{{ f.nonces | length }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <!-- 서명자정보 -->
+    <h2>{{ "7" if record.file_info.derived_files else ("6" if record.file_info.unknown_files else "5") }}. 피압수자 (서명자) 정보</h2>
+    <table>
+        <tr><th>성명</th><td>{{ record.signer_info.name }}</td></tr>
+        <tr><th>이메일</th><td>{{ record.signer_info.email }}</td></tr>
+        <tr><th>생년월일</th><td>{{ record.signer_info.birth_date }}</td></tr>
+        <tr><th>연락처</th><td>{{ record.signer_info.phone }}</td></tr>
+        <tr><th>인증서 지문</th><td style="font-family: 'Consolas', monospace; font-size: 8pt; word-break: break-all;">{{ record.signer_info.cert_fingerprint }}</td></tr>
+    </table>
+
+    <!-- 이력 -->
+    <h2>{{ "8" if record.file_info.derived_files else ("7" if record.file_info.unknown_files else "6") }}. 절차 이력</h2>
+    <p><strong>이력 요약:</strong> {{ record.history.summary }}</p>
+    {% for ev in record.history.events %}
+    <div class="history-event">
+        <strong>#{{ ev.id }}</strong> {{ ev.seal_type }} |
+        {{ ev.start_time }} ~ {{ ev.end_time }} |
+        담당: {{ ev.investigator }}
+    </div>
+    {% endfor %}
+
+    <div class="footer">
+        본 문서는 디지털증거 전자봉인시스템에 의해 자동 생성되었습니다.
+    </div>
+</body>
+</html>

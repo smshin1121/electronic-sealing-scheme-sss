@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}키 조각 업로드 - 수사관{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h3 class="mb-4">수사관 키 조각 업로드 (키 조각 2)</h3>
+        <form method="POST" action="{{ url_for('investigator.upload_share') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <div class="mb-3">
+                <label for="seal_id" class="form-label required">봉인 ID</label>
+                <input type="text" class="form-control" id="seal_id" name="seal_id"
+                       placeholder="S-20251104-ABA82E" required>
+            </div>
+            <div class="mb-3">
+                <label for="share_data" class="form-label required">키 조각 데이터</label>
+                <textarea class="form-control" id="share_data" name="share_data"
+                          rows="3" placeholder="SSS share 문자열을 붙여넣어 주세요" required></textarea>
+            </div>
+
+            <button type="submit" class="btn btn-primary">업로드</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}키 복원 - 수사관{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h3 class="mb-4">SSS 키 복원</h3>
+        <p class="text-muted">업로드된 키 조각(2개 이상)으로 원본 AES 키를 복원합니다.</p>
+
+        <form method="POST" action="{{ url_for('investigator.recover_key') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <div class="mb-3">
+                <label for="seal_id" class="form-label required">봉인 ID</label>
+                <input type="text" class="form-control" id="seal_id" name="seal_id"
+                       placeholder="S-20251104-ABA82E" required>
+            </div>
+
+            <button type="submit" class="btn btn-warning">키 복원</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

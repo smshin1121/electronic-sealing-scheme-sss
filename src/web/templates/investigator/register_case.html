@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}사건 등록 - 수사관{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h3 class="mb-4">사건 등록</h3>
+        <form method="POST" action="{{ url_for('investigator.register_case') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <div class="card mb-3">
+                <div class="card-header">봉인 정보</div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <label for="seal_id" class="form-label required">봉인 ID</label>
+                        <input type="text" class="form-control" id="seal_id" name="seal_id"
+                               placeholder="S-20251104-ABA82E" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="case_number" class="form-label required">사건번호</label>
+                        <input type="text" class="form-control" id="case_number" name="case_number" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="investigator" class="form-label required">수사관 이름</label>
+                        <input type="text" class="form-control" id="investigator" name="investigator" required>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card mb-3">
+                <div class="card-header">피압수자 정보</div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <label for="suspect_name" class="form-label required">이름</label>
+                        <input type="text" class="form-control" id="suspect_name" name="suspect_name" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="suspect_email" class="form-label">이메일</label>
+                        <input type="email" class="form-control" id="suspect_email" name="suspect_email">
+                    </div>
+                    <div class="mb-3">
+                        <label for="suspect_birth" class="form-label">생년월일</label>
+                        <input type="date" class="form-control" id="suspect_birth" name="suspect_birth">
+                    </div>
+                    <div class="mb-3">
+                        <label for="suspect_phone" class="form-label">연락처</label>
+                        <input type="tel" class="form-control" id="suspect_phone" name="suspect_phone"
+                               placeholder="010-1234-5678" autocomplete="tel">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card mb-3">
+                <div class="card-header">인증 수준 설정</div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <label for="auth_level" class="form-label">인증 수준</label>
+                        <select class="form-select" id="auth_level" name="auth_level">
+                            <option value="basic">기본 (이름+생년월일+연락처)</option>
+                            <option value="basic+password">기본 + 비밀번호</option>
+                            <option value="basic+otp">기본 + 이메일 OTP</option>
+                            <option value="basic+password+otp">기본 + 비밀번호 + OTP</option>
+                        </select>
+                    </div>
+                    <div class="mb-3" id="password-field" style="display:none;">
+                        <label for="password" class="form-label">비밀번호</label>
+                        <input type="password" class="form-control" id="password" name="password">
+                        <div class="form-text">비밀번호 인증 사용 시 입력해 주세요.</div>
+                    </div>
+                </div>
+            </div>
+
+            <button type="submit" class="btn btn-primary">사건 등록</button>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+document.getElementById('auth_level').addEventListener('change', function() {
+    const pwField = document.getElementById('password-field');
+    pwField.style.display = this.value.includes('password') ? 'block' : 'none';
+});
+</script>
+{% endblock %}
