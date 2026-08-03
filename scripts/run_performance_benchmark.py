@@ -1182,7 +1182,10 @@ def build_results_text_tex(
     sentences = [
         scope_text,
         (
-            f"As shown in Table~\\ref{{tab:performance}}, the mean encryption "
+            # (B) ICTE revision: main-text Table 4 replaced by the throughput
+            # figure; the exact numbers live in Supplementary Table S5.
+            f"As shown in Fig.~\\ref{{fig:throughput}} (tabulated in "
+            f"Supplementary Table~S5), the mean encryption "
             f"throughput was {enc_avg:.2f} MiB/s and the mean decryption "
             f"throughput was {dec_avg:.2f} MiB/s on the evaluated platform."
         ),

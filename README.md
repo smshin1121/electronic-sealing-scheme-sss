@@ -90,6 +90,7 @@ precise implementation and trust boundaries.
 | `src/web` | Reference Flask workflow for case registration, subject authentication, share submission, and recovery |
 | `scripts/run_performance_benchmark.py` | Streaming AES-GCM benchmark and LaTeX/CSV/JSON output generator |
 | `scripts/run_benchmark_pipeline.py` | Plan, run, and merge staged benchmark batches |
+| `scripts/generate_performance_figure.py` | Vector throughput figure from recorded benchmark artifacts (companion to `--emit-only`; requires matplotlib) |
 | `scripts/measure_remote_latency.py` | Client-observed timing harness for the documented evaluation-portal contract |
 | `tests` | Unit, integration, and workflow regression tests |
 
