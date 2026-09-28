@@ -6,6 +6,10 @@
     before any password work) holds on MariaDB, also for simultaneous
     registrations.
 
+Since stage F, F2 the registration form needs a signed-in administrator:
+the ``app`` fixture creates the account once, and every registration here
+comes from a client signed in to it.
+
 Skipped unless ``RELEASE_TEST_MARIADB_HOST`` is set. The server must be a
 throwaway test instance: the module drops and recreates its own database
 (``enc_release_test_e3a_fixes``). Synthetic data only. Environment as in
@@ -21,7 +25,7 @@ from typing import Any
 import pytest
 
 from tests.fixtures.concurrency import run_concurrently
-from tests.fixtures.release_web import CSRF_TOKEN, SlowDerivations
+from tests.fixtures.release_web import CSRF_TOKEN, SlowDerivations, login_admin
 
 HOST = os.environ.get("RELEASE_TEST_MARIADB_HOST", "")
 pytestmark = [
@@ -85,6 +89,9 @@ def app(monkeypatch):
 
         get_db()
         assert g.db_type == "mariadb", "the app fell back to SQLite; the MariaDB path was not exercised"
+    # The administrator account the registrations use (stage F, F2), made
+    # once here: threads that registered at once would race to create it.
+    login_admin(application.test_client())
     return application
 
 
@@ -99,14 +106,18 @@ def sent(monkeypatch) -> list[tuple[str, str]]:
 
 
 def _register(client: Any, seal_id: str, ip: str = "127.0.0.1", **overrides: str) -> Any:
+    login_admin(client)
     with client.session_transaction() as sess:
         sess["csrf_token"] = CSRF_TOKEN
     form = {"seal_id": seal_id, "case_number": "2026-N-M01", "investigator": "수사관N",
             "suspect_name": NAME, "suspect_email": EMAIL, "suspect_birth": BIRTH,
             "suspect_phone": PHONE, "auth_level": "basic", "csrf_token": CSRF_TOKEN,
             **overrides}
-    return client.post("/investigator/register-case", data=form,
+    resp = client.post("/investigator/register-case", data=form,
                        environ_base={"REMOTE_ADDR": ip})
+    if resp.status_code == 302:  # back to the form, not to the admin login
+        assert resp.headers["Location"].endswith("/investigator/register-case")
+    return resp
 
 
 def _send_otp(client: Any, seal_id: str, ip: str) -> Any:

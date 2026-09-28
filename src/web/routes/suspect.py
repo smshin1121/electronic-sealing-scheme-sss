@@ -59,7 +59,6 @@ from ..models.db_models import (
     count_recent_auth_failures,
     find_case_by_seal_id,
     find_seal_record_summaries_by_seal_id,
-    insert_key_share,
     record_auth_failure,
 )
 from ..models.privacy_models import (
@@ -79,6 +78,7 @@ from ..privacy.field_crypto import FieldCryptoError
 from ..privacy.keys import PrivacyError, privacy_keys_configured
 from ..privacy.record_access import reveal_record_json, reveal_record_pdf
 from ..privacy.record_store import LegacyRecordError
+from ..share_upload import checked_share, store_uploaded_share
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +244,9 @@ def auth(seal_id: str) -> Any:
               "danger")
         return render_template("auth.html", seal_id=seal_id, case=view, locked=True), 429
 
-    if request.method == "GET":
+    # GET and HEAD show the page; only a POST submits (stage F, F5:
+    # the CSRF hook lets HEAD through without a token).
+    if request.method != "POST":
         return _auth_page(seal_id, case, view)
     return _authenticate(seal_id, case, view)
 
@@ -411,8 +413,17 @@ def _reveal_email_within_cap(seal_id: str, client_ip: str) -> str:
 @bp.route("/upload-share", methods=["GET", "POST"])
 @bp.route("/upload-share/<seal_id>", methods=["GET", "POST"])
 def upload_share_page(seal_id: str | None = None) -> Any:
-    """Upload suspect key share (키 조각 1)."""
-    if request.method == "GET":
+    """Upload suspect key share (키 조각 1).
+
+    After the session check the share's format is checked, then it is
+    stored under the seal's current policy generation (stage F, F1;
+    :mod:`web.share_upload`): 400 for a malformed share, 409 when another
+    share 1 is stored for that generation, success when it is stored now
+    or the identical share already was.
+    """
+    # GET and HEAD show the page; only a POST submits (stage F, F5:
+    # the CSRF hook lets HEAD through without a token).
+    if request.method != "POST":
         return render_template("upload_share.html", seal_id=seal_id or "")
 
     seal_id_form = (request.form.get("seal_id") or seal_id or "").strip()
@@ -427,24 +438,15 @@ def upload_share_page(seal_id: str | None = None) -> Any:
         flash("본인 인증이 필요합니다.", "warning")
         return redirect(url_for("suspect.auth", seal_id=seal_id_form))
 
-    case = find_case_by_seal_id(seal_id_form)
-    if not case:
-        flash("해당 봉인 ID의 사건이 존재하지 않습니다.", "danger")
-        return render_template("upload_share.html", seal_id=seal_id_form), 404
-
-    try:
-        insert_key_share(
-            seal_id=seal_id_form,
-            share_index=1,
-            share_data=share_data,
-            uploaded_by="suspect",
-        )
-    except Exception:
-        logger.exception("피압수자 키 조각 업로드 실패")
-        flash("키 조각 업로드 중 오류가 발생했습니다.", "danger")
-        return render_template("upload_share.html", seal_id=seal_id_form), 500
-
-    flash("키 조각이 업로드되었습니다.", "success")
+    share, reply = checked_share(share_data, 1)
+    if reply is None:
+        if not find_case_by_seal_id(seal_id_form):
+            flash("해당 봉인 ID의 사건이 존재하지 않습니다.", "danger")
+            return render_template("upload_share.html", seal_id=seal_id_form), 404
+        reply = store_uploaded_share(seal_id_form, 1, share, "suspect")
+    flash(reply.message, reply.category)
+    if not reply.ok:
+        return render_template("upload_share.html", seal_id=seal_id_form), reply.status
     return redirect(url_for("suspect.records", seal_id=seal_id_form))
 
 

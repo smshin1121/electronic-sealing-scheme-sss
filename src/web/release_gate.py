@@ -57,16 +57,25 @@ path: as ``invalid`` when a pinned CA rejects its records or only records
 without the mark's policy verify, as ``unverifiable`` when no CA is pinned
 (the v1.0.1 fallback applies only to seals never enrolled).
 
-Share selection: both investigator paths take s2 from the request (a
-possession proof; this reference app has no investigator accounts), never
-from slot 2, which the unauthenticated upload route lets anyone fill
-first. Its presence and format are checked before any record is read, so
-a request without a well-formed share learns nothing about the seal (it is
-audited as ``not_evaluated``). Standard combines it with the stored owner
-share s1 (submitted through the authenticated subject route); the
-time-locked path with the released s3, and in strict mode s1; admin uses
-s4 and the lowest other stored slot. Every share must carry its own index
-prefix, and released audit rows name the slots used (``shares=1+2``).
+Share selection (:mod:`web.release_shares`): both investigator paths
+take s2 from the request (a possession proof; this reference app has no
+investigator accounts), never from slot 2, which the unauthenticated
+upload route lets anyone fill first. Its presence and format are checked
+before any record is read, so a request without a well-formed share
+learns nothing about the seal (it is audited as ``not_evaluated``).
+Standard combines it with a stored owner share s1 (submitted through the
+authenticated subject route); the time-locked path with the released s3,
+and in strict mode s1; admin uses s4 and another stored share. Stored
+shares are versioned by the policy generation of their upload (stage F,
+F1): with the deciding policy's generation G (0 on the legacy standard
+branch) they are tried G first, then the other generations, highest
+first, and the first recombination matching the key commitment is used;
+none stored denies as before, none matching as ``commitment_mismatch``
+(``recovery_failed`` when none recombines). An unauthenticated admin
+decision uses generation-0 shares only, s4 and the lowest other slot, as
+v1.1 did. Every share must carry its own index prefix; released audit
+rows name the slots and the generation of every stored share used
+(``shares=1+2; share 1 of generation 2``), denials what was tried.
 
 Operator: an admin attempt names the administrator account that made it,
 recorded in its audit row (``operator``); a blank or over-long one is denied
@@ -95,11 +104,10 @@ import hashlib
 import hmac
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from flask import current_app
 
@@ -130,12 +138,35 @@ from .models.db_models import (
 from .models.release_models import (
     ReleaseAuditEntry,
     find_record_jsons_newest_first,
-    find_share_by_index,
     find_wrapped_s3_newest_first,
     has_wrapped_s3,
     insert_release_audit,
 )
+from .models.share_models import StoredShare, find_share_rows
 from .release_selection import STATUS_NO_RECORD, STATUS_UNREADABLE, select_record
+from .release_shares import (
+    GENERATION_0_ONLY,
+    OWNER_SLOT,
+    Attempt,
+    Match,
+    Shares,
+    admin_attempts,
+    admin_pairs,
+    admin_pool,
+    admin_slots,
+    as_stored_shares,
+    filled_slots,
+    first_match,
+    generation_0_admin_shares,
+    owner_attempts,
+    owner_shares,
+    released_note,
+    tried_note,
+)
+# The share checks under their stage D names (tests use them as the gate's).
+from .release_shares import decode_s3 as _decode_s3
+from .release_shares import presented_s2 as _presented_s2
+from .release_shares import slot_share as _slot_share  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -158,14 +189,6 @@ _TIMELOCK_POLICY_DENIAL = {
     POLICY_INVALID: "policy_invalid",
     POLICY_EXPIRED: "policy_expired",
 }
-# At most 64 hex digits. Shares are values below the field prime
-# 2^256 + 297; all but the 297 values from 2^256 up fit (about 6% have fewer
-# digits). Those rare shares (about 2^-248 per share) are refused here and
-# need the admin path: a longer value would let the requester make the
-# vendored combiner pick a larger field, whose output width depends on s1.
-_S2_SHARE_RE = re.compile(r"2-[0-9a-f]{1,64}")
-_S3_SHARE_RE = re.compile(r"3-[0-9a-f]{1,128}")
-_ADMIN_SLOT = 4
 _CHALLENGE_BYTES = 32
 _KEY_BYTES = 32
 _MAX_DETAIL_LEN = 500
@@ -177,7 +200,7 @@ _MAX_LOG_ID_LEN = 200
 @dataclass(frozen=True)
 class ReleaseDecision:
     """Outcome of one release attempt (the key only when allowed); ``slots``
-    names the admin share slots selected (``2+4``), also on a later denial."""
+    names admin share slots (``2+4``): released, else the first pair tried."""
 
     allowed: bool
     path: str
@@ -202,7 +225,8 @@ class _PolicyContext:
 @dataclass(frozen=True)
 class _TsaEvidence:
     """Audit copy of the verified TSA token used for a decision; ``rule``
-    (the time rule and its values) ends every later audit detail."""
+    (the time rule and its values) follows every later audit detail, and
+    only a list of tried stored shares may come after it (``tail``)."""
 
     token_sha256: str
     token_b64: str
@@ -264,17 +288,19 @@ def release_timelock(seal_id: str, presented_share: str) -> ReleaseDecision:
 
 
 def release_admin(
-    seal_id: str, operator_reason: str, shares: Mapping[int, str], *,
+    seal_id: str, operator_reason: str, shares: Shares, *,
     operator: str,
 ) -> ReleaseDecision:
     """Admin override: s4 plus another stored share; reason and operator
-    (the administrator's username) required."""
+    (the administrator's username) required. ``shares`` are the seal's
+    stored shares (:func:`web.models.share_models.find_share_rows`); a
+    ``{slot: share}`` mapping, the v1.x call shape, counts as generation 0."""
     reason = (operator_reason or "").strip()
     name = (operator or "").strip()
     if len(name) > _MAX_OPERATOR_LEN:  # not a username; never truncated
         name = ""
     return _guarded(seal_id, PATH_ADMIN, reason, lambda ctx: _admin(
-        seal_id, reason, name, dict(shares), ctx
+        seal_id, reason, name, as_stored_shares(shares), ctx
     ), operator=name)
 
 
@@ -341,49 +367,59 @@ def _unauthenticated_denial(ctx: _PolicyContext) -> str:
 
 def _standard(seal_id: str, s2: str, ctx: _PolicyContext) -> ReleaseDecision:
     finish = partial(_finish, seal_id, PATH_STANDARD, ctx)
-    s1, share_problem = _stored_owner_share(seal_id)
+    owner, share_problem = owner_shares(find_share_rows(seal_id, OWNER_SLOT))
     if share_problem:
         return finish(OUTCOME_DENIED, share_problem)
-    selected = [s1, s2]
     if ctx.status == STATUS_UNREADABLE:
         return finish(OUTCOME_DENIED, "record_unreadable", detail=ctx.detail)
     if ctx.status == POLICY_INVALID:
         return finish(OUTCOME_DENIED, "policy_invalid", detail=ctx.detail)
     if ctx.status in _AUTHENTIC_STATUSES and ctx.policy is not None:
-        return _standard_verified(ctx.policy, ctx.detail, selected, finish)
+        return _standard_verified(ctx.policy, ctx.detail, owner, s2, finish)
     denial = _unauthenticated_denial(ctx)
     if denial:
         return finish(OUTCOME_DENIED, denial, detail=ctx.detail)
-    return _standard_legacy(seal_id, selected, ctx, finish)
+    return _standard_legacy(seal_id, owner, s2, ctx, finish)
 
 
 def _standard_verified(
-    policy: VerifiedPolicy, note: str, shares: list[str],
-    finish: Callable[..., Any],
+    policy: VerifiedPolicy, note: str, owner: tuple[StoredShare, ...],
+    s2: str, finish: Callable[..., Any],
 ) -> ReleaseDecision:
     """Same checks as v1.0.1, with values taken from the authenticated policy."""
     if _utc_now() < policy.unlock_time:
         return finish(OUTCOME_DENIED, "before_unlock",
                       unlock_time_iso=policy.unlock_time.isoformat())
-    key_hex = _recover_or_none(policy.seal_mode, shares)
+    return _release_matching(policy.seal_mode, policy.key_commitment,
+                             owner_attempts(owner, policy.generation, s2),
+                             "shares=1+2", note, finish)
+
+
+def _release_matching(
+    mode: str, commitment: str, attempts: list[Attempt], label: str,
+    note: str, finish: Callable[..., Any],
+) -> ReleaseDecision:
+    """Release the first attempt matching the commitment, or deny naming
+    what was tried; nothing else leaves the gate."""
+    key_hex, used, reason = _first_match(mode, attempts, commitment)
     if key_hex is None:
-        return finish(OUTCOME_DENIED, "recovery_failed")
-    if not _commitment_matches(key_hex, policy.key_commitment):
-        return finish(OUTCOME_DENIED, "commitment_mismatch")
+        return finish(OUTCOME_DENIED, reason, detail=note,
+                      tail=tried_note(attempts))
     return finish(OUTCOME_RELEASED, "released", key_hex=key_hex,
-                  detail=_join("shares=1+2", note))
+                  detail=_join(released_note(label, used), note))
 
 
 def _standard_legacy(
-    seal_id: str, shares: list[str], ctx: _PolicyContext,
-    finish: Callable[..., Any],
+    seal_id: str, owner: tuple[StoredShare, ...], s2: str,
+    ctx: _PolicyContext, finish: Callable[..., Any],
 ) -> ReleaseDecision:
     """v1.0.1 checks on unauthenticated record fields, commitment required.
 
     Same order as v1.0.1, except that the commitment is looked up before
     recombining and its absence denies: s2 comes from the request, and the
     stored s1 combined with a chosen s2 yields a value from which s1
-    follows, so an unchecked reconstruction is never returned.
+    follows, so an unchecked reconstruction is never returned. The stored
+    owner shares are tried as on the verified branch, generation 0 first.
     """
     try:
         mode = find_latest_seal_mode(seal_id)
@@ -411,13 +447,8 @@ def _standard_legacy(
     if commitment is None:
         return finish(OUTCOME_DENIED, "commitment_missing", detail=_join(
             "no key_commitment to verify the presented share", ctx.detail))
-    key_hex = _recover_or_none(mode, shares)
-    if key_hex is None:
-        return finish(OUTCOME_DENIED, "recovery_failed")
-    if not _commitment_matches(key_hex, commitment):
-        return finish(OUTCOME_DENIED, "commitment_mismatch")
-    return finish(OUTCOME_RELEASED, "released", key_hex=key_hex,
-                  detail=_join("shares=1+2", ctx.detail))
+    return _release_matching(mode, commitment, owner_attempts(owner, 0, s2),
+                             "shares=1+2", ctx.detail, finish)
 
 
 def _parse_legacy_unlock(unlock_iso: str) -> Optional[datetime]:
@@ -443,7 +474,7 @@ def _timelock(seal_id: str, s2: str, ctx: _PolicyContext) -> ReleaseDecision:
     if config.missing:
         return finish(OUTCOME_DENIED, "config_missing",
                       detail=", ".join(config.missing))
-    shares, share_problem = _timelock_shares(seal_id, policy.seal_mode, s2)
+    owner, share_problem = _timelock_owner(seal_id, policy.seal_mode)
     if share_problem:
         return finish(OUTCOME_DENIED, share_problem)
     # Only existence here: the envelopes are read after the clock and TSA
@@ -469,8 +500,8 @@ def _timelock(seal_id: str, s2: str, ctx: _PolicyContext) -> ReleaseDecision:
         # RFC 3161 2.4.2: genTime - accuracy is the earliest time of issuance.
         if stamp.earliest_gen_time < policy.unlock_time:
             return finish(OUTCOME_DENIED, "tsa_time_before_unlock")
-        return _unwrap_and_combine(policy, shares, config, imprint, challenge,
-                                   finish)
+        return _unwrap_and_combine(policy, (s2, owner), config, imprint,
+                                   challenge, finish)
     except Exception:
         logger.exception("Release gate error after the TSA check: seal_id=%r "
                          "path=%s", _clip(seal_id, _MAX_LOG_ID_LEN), PATH_TIMELOCK)
@@ -479,13 +510,17 @@ def _timelock(seal_id: str, s2: str, ctx: _PolicyContext) -> ReleaseDecision:
 
 def _unwrap_and_combine(
     policy: VerifiedPolicy,
-    shares: list[str],
+    shares: tuple[str, tuple[StoredShare, ...]],
     config: _ReleaseConfig,
     imprint: bytes,
     challenge: bytes,
     finish: Callable[..., Any],
 ) -> ReleaseDecision:
-    """Re-check the policy digest, unwrap s3, recombine, check commitment."""
+    """Re-check the policy digest, unwrap s3, recombine, check commitment.
+
+    ``shares`` are the presented s2 and, in strict mode, the usable stored
+    owner shares (tried in order, as on the standard path).
+    """
     # D5: the verified policy object is the only one used (no re-read);
     # its digest is recomputed and re-bound to the TSA imprint right here.
     if not policy.recheck_digest() or not hmac.compare_digest(
@@ -511,14 +546,13 @@ def _unwrap_and_combine(
     s3 = _decode_s3(plaintext)
     if s3 is None:
         return finish(OUTCOME_DENIED, "s3_malformed", detail=note)
-    key_hex = _recover_or_none(policy.seal_mode, [*shares, s3])
-    if key_hex is None:
-        return finish(OUTCOME_DENIED, "recovery_failed", detail=note)
-    if not _commitment_matches(key_hex, policy.key_commitment):
-        return finish(OUTCOME_DENIED, "commitment_mismatch", detail=note)
-    used = "shares=1+2+3" if policy.seal_mode == SEAL_MODE_STRICT else "shares=2+3"
-    return finish(OUTCOME_RELEASED, "released", key_hex=key_hex,
-                  detail=_join(used, note))
+    s2, owner = shares
+    label, attempts = "shares=2+3", [((), [s2, s3])]
+    if policy.seal_mode == SEAL_MODE_STRICT:
+        label = "shares=1+2+3"
+        attempts = owner_attempts(owner, policy.generation, s2, s3)
+    return _release_matching(policy.seal_mode, policy.key_commitment,
+                             attempts, label, note, finish)
 
 
 def _unwrap_first(
@@ -566,38 +600,11 @@ def _release_config() -> _ReleaseConfig:
                           TsaTrustProfile(tsa_ca, policy_oid, cert))
 
 
-def _presented_s2(presented_share: str) -> tuple[str, str]:
-    """The investigator share entered in the request (possession proof).
-
-    Only its presence and index-2 format are checked here, before any
-    record is read; a wrong share (another seal's, or the owner's s1
-    relabelled) fails the key commitment, so no key is released.
-    """
-    s2 = presented_share.strip().lower()
-    if not s2:
-        return "", "investigator_share_missing"
-    if not _S2_SHARE_RE.fullmatch(s2):
-        return "", "investigator_share_malformed"
-    return s2, ""
-
-
-def _timelock_shares(seal_id: str, mode: str, s2: str) -> tuple[list[str], str]:
-    """The presented s2; strict mode also needs the stored owner share s1."""
+def _timelock_owner(seal_id: str, mode: str) -> tuple[tuple[StoredShare, ...], str]:
+    """Strict mode also needs a stored owner share s1 (its candidates)."""
     if mode != SEAL_MODE_STRICT:
-        return [s2], ""
-    s1, problem = _stored_owner_share(seal_id)
-    if problem:
-        return [], problem
-    return [s1, s2], ""
-
-
-def _decode_s3(plaintext: bytes) -> Optional[str]:
-    """The unwrapped s3 must be an index-3 share string."""
-    try:
-        share = plaintext.decode("ascii")
-    except UnicodeDecodeError:
-        return None
-    return share if _S3_SHARE_RE.fullmatch(share) else None
+        return (), ""
+    return owner_shares(find_share_rows(seal_id, OWNER_SLOT))
 
 
 # ---------------------------------------------------------------------------
@@ -605,16 +612,17 @@ def _decode_s3(plaintext: bytes) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _admin(
-    seal_id: str, reason: str, operator: str, shares: dict[int, str],
+    seal_id: str, reason: str, operator: str, rows: tuple[StoredShare, ...],
     ctx: _PolicyContext,
 ) -> ReleaseDecision:
     """Authenticated override on stored shares.
 
     Unlike the standard path it may release an unauthenticated record
-    without a commitment (flagged). That relies on trusting the
-    authenticated administrator with the result: the other share can come
-    from slot 2, which anyone can fill through the unauthenticated upload
-    route, and a reconstruction over a planted s2 reveals s4.
+    without a commitment (flagged), on generation-0 shares only. That relies
+    on trusting the authenticated administrator with the result: the other
+    share can come from slot 2, which anyone can fill through the
+    unauthenticated upload route, and a reconstruction over a planted s2
+    reveals s4.
     """
     finish = partial(_finish, seal_id, PATH_ADMIN, ctx, operator_reason=reason,
                      operator=operator)
@@ -622,80 +630,80 @@ def _admin(
         return finish(OUTCOME_DENIED, "operator_required")
     if not reason:
         return finish(OUTCOME_DENIED, "reason_required")
-    stored = {index: share for index, share in shares.items() if share}
-    if len(stored) < 2:
+    filled = filled_slots(rows)
+    if len(filled) < 2:
         return finish(OUTCOME_DENIED, "insufficient_shares",
-                      detail=f"{len(stored)} share(s) stored")
-    selected, share_problem = _admin_shares(stored)
-    if share_problem:
+                      detail=f"{len(filled)} share(s) stored")
+    pool, share_problem = admin_pool(rows)
+    if pool is None:
         return finish(OUTCOME_DENIED, share_problem)
-    other_index, other, admin_share = selected
-    finish = partial(finish, slots=f"{other_index}+{_ADMIN_SLOT}")
+    authentic = ctx.status in _AUTHENTIC_STATUSES and ctx.policy is not None
+    pairs = admin_pairs(pool, ctx.policy.generation if authentic else 0)
+    finish = partial(finish, slots=admin_slots(pairs[0]))
     if ctx.status == STATUS_UNREADABLE:
         return finish(OUTCOME_DENIED, "record_unreadable", detail=ctx.detail)
     if ctx.status == POLICY_INVALID:
         return finish(OUTCOME_DENIED, "policy_invalid", detail=ctx.detail)
-    commitment: Optional[str] = None
-    if ctx.status in _AUTHENTIC_STATUSES and ctx.policy is not None:
-        mode, commitment = ctx.policy.seal_mode, ctx.policy.key_commitment
-    elif _unauthenticated_denial(ctx):
-        return finish(OUTCOME_DENIED, _unauthenticated_denial(ctx),
-                      detail=ctx.detail)
-    else:
-        try:
-            mode = find_latest_seal_mode(seal_id) or "standard"
-        except ValueError:
-            return finish(OUTCOME_DENIED, "seal_mode_unresolvable")
-        logger.warning("Admin override on an unauthenticated record: "
-                       "seal_id=%r policy_status=%s",
-                       _clip(seal_id, _MAX_LOG_ID_LEN), ctx.status)
+    if authentic:
+        return _admin_verified(ctx.policy, pairs, ctx.detail, finish)
+    denial = _unauthenticated_denial(ctx)
+    if denial:
+        return finish(OUTCOME_DENIED, denial, detail=ctx.detail)
+    return _admin_unauthenticated(seal_id, rows, ctx, finish)
+
+
+def _admin_verified(
+    policy: VerifiedPolicy, pairs: list[tuple[StoredShare, StoredShare]],
+    note: str, finish: Callable[..., Any],
+) -> ReleaseDecision:
+    """The first pair (in order) whose recombination matches the commitment."""
+    attempts = admin_attempts(pairs)
+    key_hex, used, reason = _first_match(policy.seal_mode, attempts,
+                                         policy.key_commitment)
+    if key_hex is None:  # the selection note too (Codex stage F, R1-2)
+        return finish(OUTCOME_DENIED, reason, detail=note,
+                      tail=tried_note(attempts))
+    slots = admin_slots(used)
+    return finish(OUTCOME_RELEASED, "released", key_hex=key_hex, slots=slots,
+                  detail=_join(released_note(f"shares={slots}", used), note))
+
+
+def _admin_unauthenticated(
+    seal_id: str, rows: tuple[StoredShare, ...], ctx: _PolicyContext,
+    finish: Callable[..., Any],
+) -> ReleaseDecision:
+    """v1.1 on generation-0 shares: s4 and the lowest other slot, no
+    commitment to check (flagged in the log and the audit status)."""
+    used, share_problem = generation_0_admin_shares(rows)
+    if share_problem:
+        return finish(OUTCOME_DENIED, share_problem,
+                      detail=_join(GENERATION_0_ONLY, ctx.detail))
+    slots = admin_slots(used)
+    finish = partial(finish, slots=slots)
     try:
-        key_hex = recover_key_for_mode(mode, [other, admin_share])
+        mode = find_latest_seal_mode(seal_id) or "standard"
+    except ValueError:
+        return finish(OUTCOME_DENIED, "seal_mode_unresolvable")
+    logger.warning("Admin override on an unauthenticated record: "
+                   "seal_id=%r policy_status=%s",
+                   _clip(seal_id, _MAX_LOG_ID_LEN), ctx.status)
+    try:
+        key_hex = recover_key_for_mode(mode, [row.data for row in used])
     except Exception:
         return finish(OUTCOME_DENIED, "recovery_failed")
-    if commitment is not None and not _commitment_matches(key_hex, commitment):
-        return finish(OUTCOME_DENIED, "commitment_mismatch")
-    return finish(OUTCOME_RELEASED, "released", key_hex=key_hex,
-                  detail=_join(f"shares={other_index}+{_ADMIN_SLOT}", ctx.detail))
-
-
-def _admin_shares(stored: dict[int, str]) -> tuple[tuple[int, str, str], str]:
-    """s4 and the lowest other stored slot, each holding its own index."""
-    empty = (0, "", "")
-    admin_share, problem = _slot_share(stored, _ADMIN_SLOT)
-    if problem:
-        return empty, f"admin_share_{problem}"
-    other_index = next((i for i in sorted(stored) if i != _ADMIN_SLOT), None)
-    if other_index is None:
-        return empty, "other_share_missing"
-    other, problem = _slot_share(stored, other_index)
-    if problem:
-        return empty, f"other_share_{problem}"
-    return (other_index, other, admin_share), ""
+    return finish(OUTCOME_RELEASED, "released", key_hex=key_hex, detail=_join(
+        released_note(f"shares={slots}", used), ctx.detail))
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _stored_owner_share(seal_id: str) -> tuple[str, str]:
-    """The owner share s1 (submitted through the authenticated subject route)."""
-    s1 = find_share_by_index(seal_id, 1)
-    if not s1:
-        return "", "owner_share_missing"
-    if not s1.startswith("1-"):
-        return "", "owner_share_malformed"
-    return s1, ""
-
-
-def _slot_share(stored: Mapping[int, str], index: int) -> tuple[str, str]:
-    """The share stored in ``index``: ``(share, "")`` or ``("", problem)``."""
-    share = stored.get(index)
-    if not share:
-        return "", "missing"
-    if not share.startswith(f"{index}-"):
-        return "", "malformed"
-    return share, ""
+def _first_match(mode: str, attempts: list[Attempt], commitment: str) -> Match:
+    """:func:`web.release_shares.first_match` with this module's
+    recombination and commitment check (looked up at each call)."""
+    return first_match(attempts, lambda shares: _recover_or_none(mode, shares),
+                       lambda key_hex: _commitment_matches(key_hex, commitment))
 
 
 def _recover_or_none(mode: str, shares: Sequence[str]) -> Optional[str]:
@@ -752,13 +760,16 @@ def _finish(
     evidence: Optional[_TsaEvidence] = None,
     unlock_time_iso: str = "",
     key_hex: Optional[str] = None,
+    tail: str = "",
 ) -> ReleaseDecision:
-    """Write the audit row, then return the decision (fail-closed)."""
+    """Write the audit row, then return the decision (fail-closed); ``tail``
+    (what was tried) goes after ``detail`` and the TSA rule, so the clip
+    shortens only it."""
     entry = ReleaseAuditEntry(
         seal_id=seal_id, path=path, policy_status=ctx.status,
         outcome=outcome, reason=reason, created_at=_utc_now().isoformat(),
         policy_digest=ctx.policy.digest_hex if ctx.policy else "",
-        detail=_clip(detail, _MAX_DETAIL_LEN),
+        detail=_clip(_join(detail, tail), _MAX_DETAIL_LEN),
         operator_reason=_clip(operator_reason, _MAX_OPERATOR_REASON_LEN),
         tsa_token_sha256=evidence.token_sha256 if evidence else "",
         tsa_token=evidence.token_b64 if evidence else "",

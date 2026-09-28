@@ -4,6 +4,12 @@
 <div class="row justify-content-center">
     <div class="col-md-8">
         <h3 class="mb-4">사건 등록</h3>
+        <p class="text-muted">로그인 계정: <strong>{{ admin_username }}</strong></p>
+        <div class="alert alert-info" role="note">
+            기관 키로 서명된 봉인 기록이 동기화되면 그 기록의 사건 정보와 피압수자 정보로
+            사건이 자동 등록됩니다. 이 양식은 서명되지 않은 기록을 동기화하는 경우처럼
+            사건을 미리 등록해야 할 때 쓰며, 등록한 관리자 계정이 사건에 함께 기록됩니다.
+        </div>
         <form method="POST" action="{{ url_for('investigator.register_case') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 

@@ -25,6 +25,18 @@ Steps:
     still hold plaintext, which no reader returns at run time, until the
     explicit conversion (``python -m src.web.privacy.migrate --apply``)
     encrypts them and sets ``'v1'``.
+  - ``cases.registered_by`` (stage F, F2), appended last, after the E3a
+    columns, as in the DDL: who registered the case (an administrator's
+    username, or ``sync:`` for a case its signed record created; see
+    :mod:`web.sync_registration`). Existing rows get ``''``: nothing
+    recorded who registered them.
+  - ``key_shares.generation`` (stage F, F1) and the unique key
+    ``(seal_id, share_index, generation)``: a table rebuild on SQLite, an
+    added column and key on MariaDB (:mod:`web.models.share_schema`).
+    Existing rows keep their ids and get generation 0. This step runs last.
+  - ``share_removal_audit`` (stage F, Fable gate finding 1): one row per
+    share an administrator removed (:mod:`web.models.share_removal_schema`),
+    created when missing, before the ``key_shares`` step.
 """
 
 from __future__ import annotations
@@ -56,6 +68,11 @@ _CASES_IDENTITY_COLUMNS = (
 _RECORD_SCHEME_COLUMN = (
     "record_scheme", "TEXT NOT NULL DEFAULT ''", "VARCHAR(16) NOT NULL DEFAULT ''",
 )
+# (column, SQLite type, MariaDB type) of cases (stage F, F2); 64 characters
+# hold any administrator username.
+_REGISTERED_BY_COLUMN = (
+    "registered_by", "TEXT NOT NULL DEFAULT ''", "VARCHAR(64) NOT NULL DEFAULT ''",
+)
 
 
 def apply_migrations(db: Any, db_type: str) -> None:
@@ -70,6 +87,9 @@ def apply_migrations(db: Any, db_type: str) -> None:
     else:
         _add_mariadb_columns(db)
     _add_sync_tables(db, db_type)
+    _add_case_registrar(db, db_type)
+    _add_share_removal_audit(db, db_type)
+    _version_key_shares(db, db_type)
 
 
 def _added_columns() -> list[tuple[str, tuple[str, str, str]]]:
@@ -99,6 +119,37 @@ def _add_sync_tables(db: Any, db_type: str) -> None:
     from .sync_schema import create_sync_tables
 
     create_sync_tables(db, db_type)
+
+
+def _add_case_registrar(db: Any, db_type: str) -> None:
+    """Stage F, F2: ``cases.registered_by``, appended after the E3a columns
+    (this step runs after them)."""
+    column, sqlite_type, mariadb_type = _REGISTERED_BY_COLUMN
+    if db_type == "sqlite":
+        _add_sqlite_column(db, "cases", column,
+                           f"ALTER TABLE cases ADD COLUMN {column} {sqlite_type}")
+        return
+    cursor = db.cursor()
+    try:
+        # A no-op (with a note, not an error) when the column exists.
+        cursor.execute(f"ALTER TABLE cases ADD COLUMN IF NOT EXISTS {column} {mariadb_type}")
+        db.commit()
+    finally:
+        cursor.close()
+
+
+def _add_share_removal_audit(db: Any, db_type: str) -> None:
+    """Stage F (Fable gate, finding 1): the audit table of share removals."""
+    from .share_removal_schema import create_share_removal_audit
+
+    create_share_removal_audit(db, db_type)
+
+
+def _version_key_shares(db: Any, db_type: str) -> None:
+    """Stage F, F1: share slots versioned by policy generation."""
+    from .share_schema import migrate_key_shares
+
+    migrate_key_shares(db, db_type)
 
 
 def _add_sqlite_column(db: Any, table: str, column: str, statement: str) -> None:

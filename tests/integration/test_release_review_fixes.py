@@ -519,7 +519,9 @@ class TestShareSelection:
         resp = recover_standard(client, seal)
 
         assert resp.status_code == 302
-        assert _last(app, seal.seal_id, "standard")["detail"] == "shares=1+2"
+        # Stage F (F1): the stored share's generation follows the slots.
+        assert _last(app, seal.seal_id, "standard")["detail"] == (
+            "shares=1+2; share 1 of generation 0")
 
     def test_admin_slot_must_hold_an_index_4_share(
         self, app, client, master_key, signer
@@ -564,7 +566,9 @@ class TestShareSelection:
         resp = _admin(client, seal.seal_id)
 
         assert resp.status_code == 200
-        assert _last(app, seal.seal_id, "admin")["detail"] == "shares=2+4"
+        # Stage F (F1): the stored shares' generations follow the slots.
+        assert _last(app, seal.seal_id, "admin")["detail"] == (
+            "shares=2+4; share 2 of generation 0, share 4 of generation 0")
 
 
 # ===================================================================
@@ -922,7 +926,9 @@ class TestStandardPossession:
 
         assert resp.status_code == 302
         assert recovered_key(client, seal.seal_id) == seal.key_hex
-        assert _last(app, seal.seal_id, "standard")["detail"] == "shares=1+2"
+        # Stage F (F1): the stored share's generation follows the slots.
+        assert _last(app, seal.seal_id, "standard")["detail"] == (
+            "shares=1+2; share 1 of generation 0")
 
     def test_occupied_slot_2_does_not_block_the_presented_share(
         self, app, client, master_key, signer

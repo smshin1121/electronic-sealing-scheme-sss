@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from flask import (
     Blueprint,
@@ -60,7 +60,10 @@ from ..models.db_models import (
     record_auth_failure,
     relabel_auth_failure,
 )
-from ..models.release_models import find_stored_shares
+from ..models.share_models import find_share_rows
+from ..models.share_removal_models import find_share_removals, list_share_summaries
+from ..release_shares import filled_slots
+from ..share_removal import MAX_SEAL_ID_LENGTH, remove_from_form
 from .release_messages import denial_response
 
 logger = logging.getLogger(__name__)
@@ -203,13 +206,49 @@ def _log_emergency(
 # ---------------------------------------------------------------------------
 @bp.route("/shares", methods=["GET"])
 def shares() -> Any:
-    """List admin key shares (키 조각 4) across all cases."""
+    """List admin key shares (키 조각 4) across all cases; with ``seal_id``
+    also every stored share of that seal (no values) and its removals."""
     admin = _require_admin()
     if admin is None:
         return _to_login()
+    seal_id = (request.args.get("seal_id") or "").strip()[:MAX_SEAL_ID_LENGTH]
+    page, readable = _shares_page(admin, seal_id)
+    return page, (200 if readable else 503)
 
-    rows = find_admin_share_summaries()
 
+def _shares_page(admin: AdminAccount, seal_id: str) -> tuple[str, bool]:
+    """The share list page (never a share value) and whether every list on
+    it could be read. A list that cannot be read (for example on a broken
+    database connection after a failed removal) is shown as unreadable,
+    never as empty, and makes the answer 503 (Codex review R3, finding 2)."""
+    rows, admin_ok = _guarded(find_admin_share_summaries, "Admin share list", "")
+    seal_shares: Any = ()
+    removals: Any = []
+    seal_ok = removals_ok = True
+    if seal_id:
+        seal_shares, seal_ok = _guarded(lambda: list_share_summaries(seal_id),
+                                        "Seal share list", seal_id)
+        removals, removals_ok = _guarded(lambda: find_share_removals(seal_id),
+                                         "Share removal log", seal_id)
+    page = render_template("shares.html", shares=_share_dicts(rows),
+                           admin_username=admin.username, seal_id=seal_id,
+                           seal_shares=seal_shares, removals=removals)
+    return page, admin_ok and seal_ok and removals_ok
+
+
+def _guarded(read: Callable[[], Any], what: str, seal_id: str) -> tuple[Any, bool]:
+    """``read()`` and True, or None and False when it fails (logged)."""
+    try:
+        return read(), True
+    except Exception:  # shown as unreadable, never as "none stored"
+        logger.exception("%s unreadable: seal_id=%r", what, seal_id[:_LOG_TEXT_LIMIT])
+        return None, False
+
+
+def _share_dicts(rows: Any) -> Optional[list[dict[str, Any]]]:
+    """The admin share rows as dicts; None stays None (unreadable)."""
+    if rows is None:
+        return None
     shares_list: list[dict[str, Any]] = []
     for row in rows:
         if isinstance(row, dict):
@@ -223,10 +262,28 @@ def shares() -> Any:
                 "share_index": row[2],
                 "uploaded_by": row[3],
                 "uploaded_at": row[4],
+                "generation": row[5],
             })
+    return shares_list
 
-    return render_template("shares.html", shares=shares_list,
-                           admin_username=admin.username)
+
+# ---------------------------------------------------------------------------
+# POST /admin/shares/remove
+# ---------------------------------------------------------------------------
+@bp.route("/shares/remove", methods=["POST"])
+def remove_share() -> Any:
+    """Remove one stored share of a seal, audited (stage F, Fable gate
+    finding 1): a wrong share in the slot of the seal's current generation
+    no longer blocks the genuine one for good (:mod:`web.share_removal`)."""
+    admin = _require_admin()
+    if admin is None:
+        return _to_login()
+    answer = remove_from_form(request.form, admin.username)
+    flash(answer.message, answer.category)
+    if answer.status == 200:
+        return redirect(url_for("admin.shares", seal_id=answer.seal_id))
+    page, readable = _shares_page(admin, answer.seal_id)
+    return page, (answer.status if readable else 503)
 
 
 # ---------------------------------------------------------------------------
@@ -237,10 +294,13 @@ def emergency_recover() -> Any:
     """Emergency key recovery using admin share (키 조각 4) + one other share.
 
     An override by design (no time gate), decided by
-    :func:`web.release_gate.release_admin`: a reason is required; s4 and the
-    lowest other stored slot are used, each holding a share of its own
-    index; an authenticated policy (verified, or signed under a since
-    expired certificate) supplies the mode and key commitment; a present
+    :func:`web.release_gate.release_admin`: a reason is required; s4 and
+    another stored share are used, each holding a share of its own index;
+    an authenticated policy (verified, or signed under a since expired
+    certificate) supplies the mode and key commitment, and the stored
+    shares are tried by policy generation until the commitment matches
+    (stage F, F1); without one, generation-0 shares only, s4 and the
+    lowest other slot, as in v1.1; a present
     policy that fails verification blocks the override; use on an
     unauthenticated record is flagged in the audit trail, or denied when
     ``RELEASE_REQUIRE_POLICY`` is set; every attempt that reaches the gate
@@ -255,7 +315,9 @@ def emergency_recover() -> Any:
         return _to_login()
     page = "emergency_recover.html"
 
-    if request.method == "GET":
+    # GET and HEAD show the page; only a POST submits (stage F, F5:
+    # the CSRF hook lets HEAD through without a token).
+    if request.method != "POST":
         return render_template(page, admin_username=admin.username)
 
     seal_id = (request.form.get("seal_id") or "").strip()
@@ -268,11 +330,11 @@ def emergency_recover() -> Any:
 
     from ..release_gate import release_admin
 
-    shares = find_stored_shares(seal_id)
+    shares = find_share_rows(seal_id)
     decision = release_admin(seal_id, reason, shares, operator=admin.username)
     _log_emergency(admin.username, seal_id, reason, decision)
     if not decision.allowed:
-        status, message = denial_response(decision, len(shares))
+        status, message = denial_response(decision, len(filled_slots(shares)))
         flash(message, "danger")
         return render_template(page, admin_username=admin.username), status
 
@@ -298,7 +360,9 @@ def login() -> Any:
     the password. Password work is limited per address (429) and per
     process (503); see the module docstring.
     """
-    if request.method == "GET":
+    # GET and HEAD show the page; only a POST submits (stage F, F5:
+    # the CSRF hook lets HEAD through without a token).
+    if request.method != "POST":
         return render_template("login.html")
 
     raw_username = request.form.get("username", "")

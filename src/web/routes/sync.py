@@ -22,7 +22,10 @@ on. The nonce of a verified envelope is claimed first under the seal's
 write lock, in the same transaction as the store; a reused nonce is
 refused (409). A submission refused with 409 after that claim still
 consumes its nonce, except a copy (below); that refusal, like the storage
-refusals under "Storage at rest", rolls the claim back.
+refusals under "Storage at rest", rolls the claim back. A submission
+refused before the lock (the 404 below for a seal without a case that it
+cannot create) claims and checks no nonce, so a replay of it is answered
+404 as well.
 
 Records are admitted by their seal policy (unsigned submissions are not
 authenticated, so this is what keeps a policy from being stripped):
@@ -80,13 +83,29 @@ the model functions decrypt them for the decisions above, which compare
 the decrypted text exactly as before. Without the privacy keys the route
 answers 503 after the authentication, binding and policy checks and stores
 nothing (no nonce is claimed); a key file that cannot be read at request
-time is 503 too (the transaction, nonce included, rolls back). A seal whose case is not registered is refused
-with 404. A seal that holds protected data but has lost its data key row
+time is 503 too (the transaction, nonce included, rolls back). A seal
+whose case is not registered is refused with 404, unless its signed
+record creates the case (below). A seal that holds protected data but has
+lost its data key row
 is refused with 503 and never given a new key (the transaction, nonce and
 generation mark included, rolls back). A seal with a stored record from before E3b that this
 submission would have to read (same event, the mark bootstrap, or the
 copy check of an authenticated record, which reads every record of the
 seal) is refused with 503 until the conversion runs.
+
+Case creation (stage F, F2; :mod:`web.sync_registration`): before the
+record of a new event is stored for a seal without a case row, a
+submission whose envelope verified and whose record's policy is
+``verified`` (not only ``expired``) for this seal creates the case from
+the record's ``case_info`` and ``signer_info``, in the same transaction as
+the nonce claim, the record and the generation mark. Any other submission
+creates nothing and is refused with 404 as above, before the lock is
+taken (so it never holds the gap lock of a missing case row). A record
+whose values cannot create the case is refused with 422, and a first sync
+that loses the case insert to a concurrent one (MariaDB) with 503 and
+``Retry-After``; both roll the transaction back, nonce claim included. A
+created case never commits without its record. An existing case is used
+as it is.
 
 Endpoint
 --------
@@ -125,6 +144,7 @@ from ..models.release_models import (
     seal_write_transaction,
     store_synced_record,
 )
+from ..models.privacy_models import case_exists
 from ..models.sync_models import (
     claim_sync_nonce,
     find_high_water,
@@ -151,6 +171,11 @@ from ..sync_auth import (
     validate_sync_config,
     verify_submission_signature,
 )
+from ..sync_registration import (
+    SyncCaseError,
+    create_case_from_record,
+    validate_sync_case_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +201,10 @@ _MSG_NOT_CONVERTED = (
     "이 봉인의 기존 기록이 아직 보호 형식으로 이관되지 않아 동기화할 수 없습니다. "
     "관리자에게 문의해 주세요."
 )
-_MSG_NO_CASE = "등록된 사건이 없어 기록을 저장할 수 없습니다. 먼저 사건을 등록해 주세요."
+_MSG_NO_CASE = (
+    "등록된 사건이 없어 기록을 저장할 수 없습니다. 기관 키로 서명된 봉인 기록이 "
+    "사건을 등록하거나, 관리자가 먼저 사건을 등록해야 합니다."
+)
 _MSG_KEY_MISSING = (
     "이 봉인의 데이터 키를 찾을 수 없어 기록을 저장할 수 없습니다. "
     "관리자에게 문의해 주세요."
@@ -203,17 +231,20 @@ class SyncRecordCopied(Exception):
 
 @dataclass(frozen=True)
 class _Admission:
-    """The incoming record's policy: digest (None unless it authenticates)
-    and generation (0 without a policy or for a version-1 policy)."""
+    """The incoming record's policy: digest (None unless it authenticates),
+    generation (0 without a policy or for a version-1 policy), and whether
+    it is ``verified`` (not only ``expired``; F2 case creation needs it)."""
 
     digest: Optional[str]
     generation: int = 0
+    verified: bool = False
 
 
 @bp.record_once
 def _validate_config(state: Any) -> None:
-    """A switch or window that cannot work refuses start-up."""
+    """A switch, window or case auth level that cannot work refuses start-up."""
     validate_sync_config(state.app.config)
+    validate_sync_case_config(state.app.config)
 
 
 @bp.route("/upload-record", methods=["POST"])
@@ -348,6 +379,11 @@ def _store(
     envelope: Optional[VerifiedSyncEnvelope],
 ) -> tuple[Any, int]:
     """Run admission and the writes under the seal's write lock."""
+    may_create = envelope is not None and admission.verified
+    if not may_create and not case_exists(event.seal_id):
+        # It could not create the case (F2): refused before the lock, so it
+        # never holds the gap lock of a missing case row (no nonce claimed).
+        return _storage_refusal(CaseNotRegistered("no case is registered"), event)
     record_json = event.record_json
     if not isinstance(record_json, str):
         record_json = json.dumps(record_json, ensure_ascii=False)
@@ -369,6 +405,8 @@ def _store(
                        "event_id=%s (seal_id=%r event_id=%s); nothing stored",
                        exc.stored_event_id, _clip(event.seal_id), event.event_id)
         return _sync_error(_MSG_RECORD_COPY, 409)
+    except SyncCaseError as exc:  # logged where raised, without values
+        return exc.response()
     except (PrivacyUnavailable, LegacyRecordError, CaseNotRegistered,
             DataKeyMissing) as exc:
         return _storage_refusal(exc, event)
@@ -405,9 +443,13 @@ def _store_serialized(
     refusal = _generation_refusal(seal_id, event_id, admission)
     if refusal is not None:
         return refusal
+    created = create_case_from_record(seal_id, event_id, record_obj, envelope,
+                                      policy_verified=admission.verified)
     try:
         store_synced_record(**stored, enrolled_digest=admission.digest)
     except DuplicateEventError:
+        if created:  # a 409 would commit the new case without its record
+            raise
         return _event_conflict(seal_id, event_id)
     _raise_mark(seal_id, event_id, admission)
     return jsonify({"status": "ok", "message": "동기화 완료"}), 200
@@ -662,7 +704,8 @@ def _assess_policy(
         assessment.policy is not None
     ):
         policy = assessment.policy
-        return _Admission(policy.digest_hex, policy.generation), None
+        return _Admission(policy.digest_hex, policy.generation,
+                          assessment.status == POLICY_VERIFIED), None
     if assessment.status == POLICY_INVALID:
         logger.warning("Sync refused: seal policy fails verification "
                        "(seal_id=%s): %s", seal_id, assessment.detail)

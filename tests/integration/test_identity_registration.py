@@ -7,7 +7,9 @@ columns of ``cases`` hold ''. Without the keys, registration answers 503.
 New case passwords are scrypt hashes and follow the 12-character policy;
 a password is stored only when the authentication level uses it. Both
 schema variants declare the new columns and tables, and an existing
-``cases`` table gains the columns at start-up. Synthetic data only.
+``cases`` table gains the columns at start-up. Since stage F, F2 the form
+needs a signed-in administrator (the ``client`` here has one), and
+``registered_by`` follows the E3a columns. Synthetic data only.
 """
 
 from __future__ import annotations
@@ -19,7 +21,12 @@ from typing import Any
 import pytest
 
 from tests.fixtures.privacy_keys import clear_privacy_keys, read_pepper
-from tests.fixtures.release_web import CSRF_TOKEN, make_release_app, post_form
+from tests.fixtures.release_web import (
+    CSRF_TOKEN,
+    login_admin,
+    make_release_app,
+    post_form,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -41,7 +48,10 @@ def app(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def client(app):
-    return app.test_client()
+    """A client signed in as an administrator (stage F, F2: the form needs one)."""
+    client = app.test_client()
+    login_admin(client)
+    return client
 
 
 def _form(seal_id: str, **overrides: str) -> dict[str, str]:
@@ -285,7 +295,8 @@ class TestSchema:
         keys = [r["name"] for r in _rows(app, "PRAGMA table_info(seal_data_keys)")]
         audit = [r["name"] for r in _rows(app, "PRAGMA table_info(identity_access_audit)")]
 
-        assert cases[-len(NEW_CASE_COLUMNS):] == NEW_CASE_COLUMNS
+        # Stage F, F2 appended registered_by after them.
+        assert cases[-len(NEW_CASE_COLUMNS) - 1:] == NEW_CASE_COLUMNS + ["registered_by"]
         assert keys == ["seal_id", "wrapped_key", "created_at"]
         assert audit == ["id", "seal_id", "field", "purpose", "actor_role", "actor",
                          "client_address", "outcome", "created_at"]
@@ -302,11 +313,12 @@ class TestSchema:
         make_release_app(tmp_path, monkeypatch)  # idempotent
 
         columns = [r["name"] for r in _rows(app, "PRAGMA table_info(cases)")]
-        assert columns[-len(NEW_CASE_COLUMNS):] == NEW_CASE_COLUMNS
-        assert all(columns.count(c) == 1 for c in NEW_CASE_COLUMNS)
+        # The E3a step runs before the F2 one, so registered_by comes last.
+        assert columns[-len(NEW_CASE_COLUMNS) - 1:] == NEW_CASE_COLUMNS + ["registered_by"]
+        assert all(columns.count(c) == 1 for c in NEW_CASE_COLUMNS + ["registered_by"])
         old = _case(app, "S-20260101-OLD001")
         assert old["suspect_name"] == "김철수" and old["identity_scheme"] == ""
-        assert old["suspect_name_digest"] == ""
+        assert old["suspect_name_digest"] == "" and old["registered_by"] == ""
 
 
 # ``cases`` as v1.0.1 (a2dc8e6) created it on SQLite, with one plaintext row.

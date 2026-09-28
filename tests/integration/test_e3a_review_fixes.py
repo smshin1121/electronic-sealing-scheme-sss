@@ -11,7 +11,9 @@
     derivations, and registrations that hash a password first reserve a
     place in a per-address budget; excess requests never reach the KDF.
 
-Synthetic data only.
+Since stage F, F2 the registration form needs a signed-in administrator:
+the ``app`` fixture creates the account once, and every registration here
+comes from a client signed in to it. Synthetic data only.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from tests.fixtures.record_protection import (
     synthetic_pdf,
     write_pre_e3b_database,
 )
-from tests.fixtures.release_web import CSRF_TOKEN, make_release_app, post_form
+from tests.fixtures.release_web import CSRF_TOKEN, login_admin, make_release_app, post_form
 
 pytestmark = pytest.mark.integration
 
@@ -43,7 +45,11 @@ BIRTH, PHONE = "1979-11-02", "010-7531-8642"
 
 @pytest.fixture()
 def app(tmp_path, monkeypatch):
-    return make_release_app(tmp_path, monkeypatch)
+    application = make_release_app(tmp_path, monkeypatch)
+    # The administrator account the registrations use (stage F, F2), made
+    # once here: threads that registered at once would race to create it.
+    login_admin(application.test_client())
+    return application
 
 
 @pytest.fixture()
@@ -65,7 +71,15 @@ def _register(client: Any, seal_id: str, **overrides: str) -> Any:
     form = {"seal_id": seal_id, "case_number": "2026-N-001", "investigator": "수사관N",
             "suspect_name": NAME, "suspect_email": EMAIL, "suspect_birth": BIRTH,
             "suspect_phone": PHONE, "auth_level": "basic", **overrides}
-    return post_form(client, "/investigator/register-case", form)
+    login_admin(client)
+    return _registered(post_form(client, "/investigator/register-case", form))
+
+
+def _registered(resp: Any) -> Any:
+    """The answer; a redirect must lead back to the form, not to the login."""
+    if resp.status_code == 302:
+        assert resp.headers["Location"].endswith("/investigator/register-case")
+    return resp
 
 
 def _send_otp(client: Any, seal_id: str, ip: str) -> Any:
@@ -239,14 +253,15 @@ class TestScrubCheckpoints:
 # ===================================================================
 
 def _register_from(client: Any, seal_id: str, ip: str, **overrides: str) -> Any:
+    login_admin(client)
     with client.session_transaction() as sess:
         sess["csrf_token"] = CSRF_TOKEN
     form = {"seal_id": seal_id, "case_number": "2026-N3-001", "investigator": "수사관N",
             "suspect_name": NAME, "suspect_email": EMAIL, "suspect_birth": BIRTH,
             "suspect_phone": PHONE, "auth_level": "basic", "csrf_token": CSRF_TOKEN,
             **overrides}
-    return client.post("/investigator/register-case", data=form,
-                       environ_base={"REMOTE_ADDR": ip})
+    return _registered(client.post("/investigator/register-case", data=form,
+                                   environ_base={"REMOTE_ADDR": ip}))
 
 
 def _login_from(client: Any, seal_id: str, ip: str, secret: str) -> Any:

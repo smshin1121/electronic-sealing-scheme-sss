@@ -467,7 +467,9 @@ def get_case_detail(db_path: str, seal_id: str) -> Optional[dict]:
 def get_case_artifacts(db_path: str, seal_id: str) -> list[dict]:
     """Return list of artifact files for a case.
 
-    Each dict: file_path, file_type, created_at, size_bytes.
+    Each dict: file_path, file_type, created_at, size_bytes. The record
+    JSON is that of the stored record's last event (:func:`_latest_record_file`),
+    beside the stored PDF.
     """
     if not seal_id:
         raise ValueError("seal_id는 비어 있을 수 없습니다.")
@@ -500,15 +502,19 @@ def get_case_artifacts(db_path: str, seal_id: str) -> list[dict]:
     if enc_path:
         artifacts.append(_make_artifact(enc_path, "enc", created_at))
 
-    # JSON record file (same directory as PDF)
+    # JSON record file of the stored record's last event, beside its PDF
+    # (stage F, F3: before, always the sealing record's name)
     if pdf_path:
-        json_path = str(Path(pdf_path).parent / f"{seal_id}_record.json")
+        json_path = _latest_record_file(seal_id, record, pdf_path)
         artifacts.append(_make_artifact(json_path, "JSON", created_at))
 
-    # Key file
+    # Key file: written only at sealing (S5), beside the sealing PDF. After
+    # an unsealing or a reseal the stored PDF is that step's, so the key is
+    # listed only where it is (the step used the sealing folder).
     if pdf_path:
-        key_path = str(Path(pdf_path).parent / f"{seal_id}_key.pem")
-        artifacts.append(_make_artifact(key_path, "key", created_at))
+        key_path = Path(pdf_path).parent / f"{seal_id}_key.pem"
+        if (_last_step(record) or "Sealing") == "Sealing" or key_path.exists():
+            artifacts.append(_make_artifact(str(key_path), "key", created_at))
 
     return artifacts
 

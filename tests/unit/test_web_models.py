@@ -185,7 +185,8 @@ class TestKeyShareCRUD:
 
             shares = find_key_shares_by_seal_id("S-SHARE-001")
             assert len(shares) == 1
-            # Original data preserved (INSERT OR IGNORE)
+            # Original data preserved (stage F, F1: another share for the
+            # same slot and generation is a conflict and is not stored)
             assert shares[0]["share_data"] == "share-data-1"
 
     def test_empty_seal_id_returns_empty(self, app: Any) -> None:

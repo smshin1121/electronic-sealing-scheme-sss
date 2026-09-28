@@ -67,12 +67,13 @@ def test_the_migration_adds_the_tables_to_an_existing_database(
     conn.execute("INSERT INTO cases (seal_id, case_number, investigator, "
                  "suspect_name) VALUES ('S-20260928-OLD001', 'c', 'i', 's')")
     conn.commit()
-    assert not {"sync_nonces", "policy_high_water"} & _tables(conn)
+    added = {"sync_nonces", "policy_high_water", "share_removal_audit"}
+    assert not added & _tables(conn)
 
     db_models.create_schema(conn, "sqlite")
     db_models.create_schema(conn, "sqlite")  # idempotent
 
-    assert {"sync_nonces", "policy_high_water"} <= _tables(conn)
+    assert added <= _tables(conn)  # the audit table since stage F (Fable re-check)
     assert conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0] == 1
     conn.execute("INSERT INTO policy_high_water VALUES "
                  "('S-20260928-OLD001', 1, ?, 1, 't')", ("ab" * 32,))
@@ -107,6 +108,13 @@ def test_the_mariadb_migration_creates_the_tables_after_the_operator_step() -> N
     assert conn.statements[0].startswith(
         "ALTER TABLE release_audit ADD COLUMN IF NOT EXISTS operator")
     created = [s.split()[5] for s in conn.statements if s.startswith("CREATE")]
+    # Since stage F (Fable gate, finding 1) the share-removal audit table and
+    # its index follow the sync tables.
     assert created == ["sync_nonces", "idx_sync_nonces_expiry",
-                       "policy_high_water"]
-    assert all("IF NOT EXISTS" in s for s in conn.statements[1:])
+                       "policy_high_water", "share_removal_audit",
+                       "idx_share_removal_audit_seal"]
+    # Every step is idempotent; since stage F (F1) one of them drops the
+    # v1.x key of key_shares (DROP INDEX IF EXISTS).
+    assert all("IF NOT EXISTS" in s or s.startswith("ALTER TABLE key_shares "
+                                                    "DROP INDEX IF EXISTS ")
+               for s in conn.statements[1:])

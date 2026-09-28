@@ -5,7 +5,9 @@ real server: the DDL of the protected ``cases`` columns and of
 ``seal_data_keys`` and ``identity_access_audit``, registration, basic
 authentication and OTP delivery on tuple rows, the legacy password
 upgrade, the ``ADD COLUMN IF NOT EXISTS`` migration of a v1.0.1 ``cases``
-table, and the conversion CLI under ``SELECT ... FOR UPDATE``.
+table, and the conversion CLI under ``SELECT ... FOR UPDATE``. Since stage
+F, F2 registrations come from a separate administrator's client, and
+``registered_by`` follows the E3a columns.
 
 Skipped unless ``RELEASE_TEST_MARIADB_HOST`` is set. The server must be a
 throwaway test instance: the module drops and recreates databases whose
@@ -25,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from tests.fixtures.release_web import CSRF_TOKEN, post_form
+from tests.fixtures.release_web import CSRF_TOKEN, login_admin, post_form
 
 HOST = os.environ.get("RELEASE_TEST_MARIADB_HOST", "")
 pytestmark = [
@@ -161,10 +163,17 @@ def sent(monkeypatch) -> list[tuple[str, str]]:
 
 
 def _register(client: Any, seal_id: str, **overrides: str) -> Any:
+    """Register from a separate administrator's client (stage F, F2), so
+    ``client`` stays an unauthenticated visitor."""
     form = {"seal_id": seal_id, "case_number": "2026-E3A-M", "investigator": "수사관A",
             "suspect_name": NAME, "suspect_email": EMAIL, "suspect_birth": BIRTH,
             "suspect_phone": PHONE, "auth_level": "basic", **overrides}
-    return post_form(client, "/investigator/register-case", form)
+    admin = client.application.test_client()
+    login_admin(admin)
+    resp = post_form(admin, "/investigator/register-case", form)
+    if resp.status_code == 302:  # back to the form, not to the admin login
+        assert resp.headers["Location"].endswith("/investigator/register-case")
+    return resp
 
 
 def _auth(client: Any, seal_id: str, **overrides: str) -> Any:
@@ -178,7 +187,9 @@ class TestMariadbSchema:
         keys = _columns(DB, "seal_data_keys")
         audit = _columns(DB, "identity_access_audit")
 
-        assert [(n, t.lower()) for n, t in cases[-6:]] == NEW_CASE_COLUMNS
+        # Stage F, F2 appended registered_by after them.
+        assert [(n, t.lower()) for n, t in cases[-7:]] == NEW_CASE_COLUMNS + [
+            ("registered_by", "varchar(64)")]
         assert [n for n, _ in keys] == ["seal_id", "wrapped_key", "created_at"]
         assert [n for n, _ in audit] == ["id", "seal_id", "field", "purpose", "actor_role",
                                          "actor", "client_address", "outcome", "created_at"]
@@ -257,8 +268,10 @@ class TestMariadbMigration:
         _make_app(monkeypatch, MIGRATION_DB)
         _make_app(monkeypatch, MIGRATION_DB)  # the column step is idempotent
         cases = _columns(MIGRATION_DB, "cases")
-        assert [(n, t.lower()) for n, t in cases[-6:]] == NEW_CASE_COLUMNS
-        assert len(cases) == 12 + 6
+        # The E3a step runs before the F2 one, so registered_by comes last.
+        assert [(n, t.lower()) for n, t in cases[-7:]] == NEW_CASE_COLUMNS + [
+            ("registered_by", "varchar(64)")]
+        assert len(cases) == 12 + 6 + 1
 
         from web.cli_support import build_cli_app
         from web.privacy.migrate import main

@@ -4,6 +4,9 @@
     birth date and phone and encrypts name and e-mail under a new per-seal
     data key, then stores the case row and the wrapped data key in one
     transaction. The plaintext columns hold ''.
+    :func:`register_protected_case_uncommitted` stores the same rows in
+    the caller's transaction (stage F, F2: the case a signed record
+    creates under the seal's write lock, :mod:`web.sync_registration`).
   - :func:`verify_basic_identity` digests the submitted name, birth date
     and phone and compares all three with the stored digests
     (:func:`web.privacy.digests.digest_matches`, constant time, no early
@@ -39,6 +42,7 @@ from ..models.privacy_models import (
     find_wrapped_data_key,
     insert_identity_access,
     insert_protected_case,
+    insert_protected_case_uncommitted,
 )
 from .digests import (
     FIELD_BIRTH,
@@ -75,7 +79,12 @@ class IdentityAuditError(PrivacyError):
 
 @dataclass(frozen=True)
 class CaseRegistration:
-    """A case to register; the identity values are never stored as given."""
+    """A case to register; the identity values are never stored as given.
+
+    ``registered_by`` (stage F, F2) names who registered it: the signed-in
+    administrator's username, or ``sync:<certificate prefix>`` for a case
+    created by its signed seal record.
+    """
 
     seal_id: str
     case_number: str
@@ -86,6 +95,7 @@ class CaseRegistration:
     phone: str = field(default="", repr=False)
     auth_level: str = "basic"
     password_hash: str = field(default="", repr=False)
+    registered_by: str = ""
 
 
 def register_protected_case(registration: CaseRegistration) -> int:
@@ -94,6 +104,30 @@ def register_protected_case(registration: CaseRegistration) -> int:
     Raises:
         PrivacyUnavailable: The identity-protection keys are not configured.
     """
+    case, wrapped = _protected_case(registration)
+    case_id = insert_protected_case(case, wrapped, utc_now_iso())
+    logger.info("Case registered with a protected identity: seal_id=%r",
+                registration.seal_id[:200])
+    return case_id
+
+
+def register_protected_case_uncommitted(registration: CaseRegistration) -> int:
+    """As :func:`register_protected_case`, in the caller's transaction.
+
+    Nothing is committed here: call it under the seal's write lock
+    (``seal_write_transaction``), which commits the case row and its data
+    key with the caller's other writes or rolls all of them back.
+
+    Raises:
+        PrivacyUnavailable: The identity-protection keys are not configured
+            or not readable.
+    """
+    case, wrapped = _protected_case(registration)
+    return insert_protected_case_uncommitted(case, wrapped, utc_now_iso())
+
+
+def _protected_case(registration: CaseRegistration) -> tuple[NewCase, bytes]:
+    """The case row (identity protected) and its new data key, wrapped."""
     keys = load_privacy_keys()
     seal_id = registration.seal_id
     data_key = new_data_key()
@@ -112,10 +146,9 @@ def register_protected_case(registration: CaseRegistration) -> int:
         investigator=registration.investigator,
         auth_level=registration.auth_level,
         password_hash=registration.password_hash, identity=identity,
+        registered_by=registration.registered_by,
     )
-    case_id = insert_protected_case(case, wrapped, utc_now_iso())
-    logger.info("Case registered with a protected identity: seal_id=%r", seal_id[:200])
-    return case_id
+    return case, wrapped
 
 
 def protect_identity(

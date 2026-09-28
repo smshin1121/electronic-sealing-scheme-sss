@@ -88,6 +88,13 @@ class BaseConfig:
     SYNC_SIGNATURE_WINDOW_SECONDS: int = int(
         os.environ.get("SYNC_SIGNATURE_WINDOW_SECONDS", "300")
     )
+    # Case creation by the signed record (stage F, F2): a sync whose
+    # envelope verifies and whose record's policy is verified creates the
+    # seal's missing case from the record, with this authentication level
+    # for the subject: "basic" (name, birth date, phone) or "basic+otp"
+    # (the record's e-mail is then required). No password exists for such
+    # a case, so no password level; any other value refuses start-up.
+    SYNC_CASE_AUTH_LEVEL: str = os.environ.get("SYNC_CASE_AUTH_LEVEL", "basic")
 
     # --- OTP ---
     OTP_LENGTH: int = 6

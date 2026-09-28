@@ -121,6 +121,38 @@ def stored_maximum(
     return found.policy.generation, found.policy.digest_hex, event_id
 
 
+def current_generation(
+    seal_id: str, read_records: RecordReader, *, ca_path: Optional[str],
+    stored: Optional[int] = None,
+) -> int:
+    """The generation of the seal's newest authenticated policy (stage F, F1).
+
+    The mark's generation when the seal has a high-water mark; otherwise
+    the highest authenticated generation among the stored records, as sync
+    admission bootstraps the mark (:func:`stored_generation`); 0 when no
+    stored record carries an authenticated policy. ``stored`` is that
+    stored maximum when the caller has read it already (the upload reads it
+    before taking the seal's write lock); it is used only while the seal
+    still has no mark. Read-only: it neither seeds the mark nor enrolls the
+    seal. Used to tag uploaded key shares (:mod:`web.share_upload`).
+    """
+    mark = find_high_water(seal_id)
+    if mark is not None:
+        return mark.generation
+    if stored is not None:
+        return stored
+    return stored_generation(seal_id, read_records, ca_path=ca_path)
+
+
+def stored_generation(
+    seal_id: str, read_records: RecordReader, *, ca_path: Optional[str]
+) -> int:
+    """The highest authenticated generation among the stored records
+    (:func:`stored_maximum`; version-1 policies count as 0), else 0."""
+    top = stored_maximum(seal_id, read_records, ca_path=ca_path)
+    return 0 if top is None else top[0]
+
+
 def classify_record(
     record_json: Any, seal_id: str, ca_path: Optional[str]
 ) -> Selection:

@@ -13,7 +13,8 @@ functions decrypt, so sync admission and the release gate keep their rules.
   - Without the privacy keys the sync route answers 503 and stores nothing;
     a key file unreadable at request time is 503 with an ERROR log that
     holds neither key bytes nor record content. A seal without a case is
-    refused with 404.
+    refused with 404 (since stage F, F2, unless its signed record creates
+    the case; one that cannot is refused and creates nothing).
   - Rows stored before E3b (``record_scheme = ''``) are never read as
     plaintext: the gate denies, sync answers 503 (run the migration).
   - Identical resubmission, conflicts and displacement behave as before.
@@ -429,11 +430,29 @@ class TestFailClosed:
     def test_a_signed_submission_without_a_case_keeps_its_nonce_unused(
         self, app, master_key, signer
     ) -> None:
+        # Stage F, F2: a signed record with a verified policy creates its
+        # case, but this synthetic record carries no investigator and no
+        # signer_info, so the creation is refused (422) and rolled back.
         seal = _seal("S-20260928-E3B024", master_key, signer)
         body = signed_payload(seal, signer)
 
+        assert _post(app, body, case=False).status_code == 422
+        assert nonce_rows(app) == []
+        assert sql_rows(app, "SELECT * FROM cases") == []
+        assert _post(app, body).status_code == 200
+
+    def test_a_signed_submission_that_cannot_create_a_case_is_404(
+        self, app, master_key, signer
+    ) -> None:
+        # A signed envelope over a record without a policy creates no case
+        # (F2): refused with 404 as before, and its nonce stays unused.
+        seal = _seal("S-20260928-E3B026", master_key, None)
+        body = signed_payload(seal, signer, record=identity_record(seal),
+                              include_wrapped=False)
+
         assert _post(app, body, case=False).status_code == 404
         assert nonce_rows(app) == []
+        assert sql_rows(app, "SELECT * FROM cases") == []
         assert _post(app, body).status_code == 200
 
 

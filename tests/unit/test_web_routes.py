@@ -374,8 +374,12 @@ class TestBirthDateFormatCompatibility:
         """Registration digests the canonical YYYYMMDD form.
 
         Stage E (E3a): the birth date is stored as a keyed digest of the
-        normalised value, and the plaintext column holds ''.
+        normalised value, and the plaintext column holds ''. Stage F (F2):
+        the form needs a signed-in administrator.
         """
+        from tests.fixtures.release_web import login_admin
+
+        login_admin(client)
         with client.session_transaction() as sess:
             sess["csrf_token"] = "test-token"  # public-test-fixture
 
@@ -420,6 +424,14 @@ class TestInvestigatorRoutes:
     """Basic investigator route smoke tests."""
 
     def test_register_case_get(self, client: Any) -> None:
+        """Stage F (F2): the form needs a signed-in administrator."""
+        from tests.fixtures.release_web import login_admin
+
+        anonymous = client.get("/investigator/register-case")
+        assert anonymous.status_code == 302
+        assert anonymous.headers["Location"].endswith("/admin/login")
+
+        login_admin(client)
         resp = client.get("/investigator/register-case")
         assert resp.status_code == 200
 
@@ -432,6 +444,9 @@ class TestInvestigatorRoutes:
         assert resp.status_code == 200
 
     def test_register_case_post_missing_fields(self, client: Any) -> None:
+        from tests.fixtures.release_web import login_admin
+
+        login_admin(client)  # Stage F (F2): an administrator's form
         with client.session_transaction() as sess:
             sess["csrf_token"] = "test-token"  # public-test-fixture
 

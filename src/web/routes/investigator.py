@@ -2,7 +2,7 @@
 
 Endpoints
 ---------
-POST /investigator/register-case  -- 사건 등록
+POST /investigator/register-case  -- 사건 등록 (관리자 로그인 필요)
 POST /investigator/upload-share   -- 키 조각 2 업로드 (관리자 비상 복구용)
 POST /investigator/recover-key    -- SSS 키 복원 (표준 경로 s1+입력한 s2)
 POST /investigator/recover-key-timelock -- 시간 잠금 해제 (입력한 s2+s3, TSA 검증)
@@ -14,6 +14,13 @@ Both recovery routes decide through the single release gate
 Both take the investigator share s2 from the form: this reference app has
 no investigator accounts, so holding the share is the credential, and a
 share uploaded to slot 2 is used only by the admin emergency path.
+
+Case registration (stage F, F2): the form needs a signed-in administrator
+account (E4); it was open to anyone until v1.1 (Fable gate, finding 4). A
+case is also created by its seal's signed record on the first sync
+(:mod:`web.sync_registration`); both follow the rules of
+:mod:`web.case_rules`, and ``cases.registered_by`` records which of them
+registered it.
 """
 
 from __future__ import annotations
@@ -37,15 +44,20 @@ from flask import (
 from ..auth.case_passwords import check_case_password_policy, hash_case_password
 from ..auth.kdf_slots import DerivationBusy
 from ..auth.passwords import PasswordPolicyError
+from ..case_rules import AUTH_LEVELS, FIELD_LIMITS, RESERVED_SEAL_PREFIX
 from ..models.db_models import (
     count_recent_auth_failures,
     delete_auth_failure,
     find_case_by_seal_id,
-    insert_key_share,
     record_auth_failure,
 )
+from ..models.privacy_models import CaseInsertError
 from ..privacy.case_identity import CaseRegistration, register_protected_case
 from ..privacy.keys import PrivacyUnavailable, privacy_keys_configured
+from ..share_upload import checked_share, store_uploaded_share
+# The admin blueprint's session check (E4), which re-reads the account on
+# every request; the registration form reuses it (stage F, F2).
+from .admin import _require_admin, _to_login
 from .release_messages import denial_response
 
 logger = logging.getLogger(__name__)
@@ -73,9 +85,10 @@ _MSG_BUSY = (
 # (per client address), like E4's admin login budget. Seal IDs may not
 # start with '@', so no case can share these counters.
 _REGISTRATION_KEY = "@case-registration"
-_RESERVED_PREFIX = "@"
+_RESERVED_PREFIX = RESERVED_SEAL_PREFIX
 # The levels the registration form offers; each includes the basic check.
-_AUTH_LEVELS = ("basic", "basic+password", "basic+otp", "basic+password+otp")
+_AUTH_LEVELS = AUTH_LEVELS
+_PAGE = "register_case.html"
 _FORM_FIELDS = (
     "seal_id", "case_number", "investigator", "suspect_name", "suspect_email",
     "suspect_birth", "suspect_phone", "auth_level",
@@ -86,18 +99,20 @@ _REQUIRED_FIELDS = (
     ("investigator", "수사관 이름을 입력해 주세요."),
     ("suspect_name", "피압수자 이름을 입력해 주세요."),
 )
-# The v1.0.1 MariaDB column sizes, checked before any write: the identity
-# columns now hold '', and the seal ID is also the associated data of the
-# ciphertexts, so MariaDB must never store it truncated.
-_FIELD_LIMITS = (
-    ("seal_id", 64, "봉인 ID"),
-    ("case_number", 128, "사건번호"),
-    ("investigator", 128, "수사관 이름"),
-    ("suspect_name", 128, "피압수자 이름"),
-    ("suspect_email", 256, "이메일"),
-    ("suspect_birth", 16, "생년월일"),
-    ("suspect_phone", 32, "연락처"),
+# The v1.0.1 MariaDB column sizes (web.case_rules), checked before any
+# write: the identity columns now hold '', and the seal ID is also the
+# associated data of the ciphertexts, so MariaDB must never store it
+# truncated. A signed record that creates its case follows the same limits.
+_FIELD_LABELS = (
+    ("seal_id", "봉인 ID"),
+    ("case_number", "사건번호"),
+    ("investigator", "수사관 이름"),
+    ("suspect_name", "피압수자 이름"),
+    ("suspect_email", "이메일"),
+    ("suspect_birth", "생년월일"),
+    ("suspect_phone", "연락처"),
 )
+_FIELD_LIMITS = tuple((name, FIELD_LIMITS[name], label) for name, label in _FIELD_LABELS)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +120,22 @@ _FIELD_LIMITS = (
 # ---------------------------------------------------------------------------
 @bp.route("/register-case", methods=["GET", "POST"])
 def register_case() -> Any:
-    """Register a new case (사건 등록); the subject's identity is protected.
+    """Register a new case (사건 등록); a signed-in administrator only.
+
+    Stage F (F2): GET and POST need the session of an enabled
+    administrator account (E4). The admin blueprint's check re-reads the
+    account on every request, so the session of a disabled or deleted
+    account ends here too; the v1.0.1 ``is_admin`` flag counts for nothing.
+    Without one, both are redirected to the admin login (302, as every
+    admin page answers); nothing is read from the form or stored, and no
+    budget place is reserved. Only a POST (which the CSRF check covers)
+    registers; any other method, such as the HEAD Flask adds, gets the
+    page. The case records the account's username in ``registered_by``.
+    Otherwise the form behaves as in v1.1 (below). A seal whose signed
+    record reached the sync route first has registered its own case
+    (:mod:`web.sync_registration`) and is refused with 409 like any
+    existing seal ID, also when that sync creates the case between the
+    form's check and its insert.
 
     Stage E (E3a): the name, birth date and phone are stored as keyed
     digests and the name and e-mail as ciphertexts under a new per-seal
@@ -118,56 +148,75 @@ def register_case() -> Any:
     columns (seal ID 64, case number and investigator 128, name 128,
     e-mail 256, birth date 16, phone 32).
 
-    The route is unauthenticated, and hashing a password costs one scrypt
-    derivation (about 32 MiB): such a registration first reserves a place
-    in its client address's budget (429 beyond it), then needs a free slot
-    of the case-password pool (503, with its reservation withdrawn,
-    otherwise); neither refusal derives anything.
+    Hashing a password costs one scrypt derivation (about 32 MiB): such a
+    registration first reserves a place in its client address's budget
+    (429 beyond it), then needs a free slot of the case-password pool
+    (503, with its reservation withdrawn, otherwise); neither refusal
+    derives anything.
     """
-    page = "register_case.html"
-    if request.method == "GET":
-        return render_template(page)
+    admin = _require_admin()
+    if admin is None:
+        return _to_login()
+    registrar = admin.username
+    # Only a POST registers: Flask answers HEAD on this route as well, and
+    # the CSRF check skips HEAD, so a HEAD with a form body gets the page.
+    if request.method != "POST":
+        return _form_page(registrar)
     if not privacy_keys_configured():
         flash(_MSG_PRIVACY_KEYS_MISSING, "danger")
-        return render_template(page), 503
+        return _form_page(registrar, 503)
 
     form = _registration_form()
     errors = _registration_errors(form)
     if errors:
         for error in errors:
             flash(error, "danger")
-        return render_template(page), 400
+        return _form_page(registrar, 400)
     if find_case_by_seal_id(form["seal_id"]):
         flash("이미 등록된 봉인 ID입니다.", "warning")
-        return render_template(page), 409
+        return _form_page(registrar, 409)
     reservation = None
     if _uses_factor(form["auth_level"], "password"):
         reservation = _reserve_registration()
         if reservation is None:
             window = current_app.config.get("CASE_REGISTRATION_WINDOW_SECONDS", 600)
             flash(_MSG_REGISTRATION_BUDGET.format(minutes=window // 60), "danger")
-            return render_template(page), 429
-    return _store_registration(page, form, reservation)
+            return _form_page(registrar, 429)
+    return _store_registration(form, reservation, registrar)
 
 
-def _store_registration(page: str, form: dict[str, str], reservation: Optional[int]) -> Any:
+def _form_page(registrar: str, status: int = 200,
+               headers: Optional[dict[str, str]] = None) -> Any:
+    """The registration page, naming the signed-in administrator."""
+    return render_template(_PAGE, admin_username=registrar), status, headers or {}
+
+
+def _store_registration(form: dict[str, str], reservation: Optional[int],
+                        registrar: str) -> Any:
     """Hash the password (if any), store the protected case, answer."""
     try:
-        register_protected_case(_case_registration(form))
+        register_protected_case(_case_registration(form, registrar))
     except DerivationBusy:
         if reservation is not None:
             delete_auth_failure(reservation)  # refused before any password work
         logger.warning("Case registration refused: case-password checks at capacity")
         flash(_MSG_BUSY, "danger")
-        return render_template(page), 503, {"Retry-After": "1"}
+        return _form_page(registrar, 503, {"Retry-After": "1"})
     except PrivacyUnavailable:
         flash(_MSG_PRIVACY_KEYS_MISSING, "danger")
-        return render_template(page), 503
-    except Exception:
+        return _form_page(registrar, 503)
+    except Exception as exc:
+        # A signed record's sync may have created the case after the check
+        # above (F2): the insert then fails, and the answer is the same 409.
+        if isinstance(exc, CaseInsertError) and find_case_by_seal_id(form["seal_id"]):
+            flash("이미 등록된 봉인 ID입니다.", "warning")
+            return _form_page(registrar, 409)
         logger.exception("사건 등록 실패")
         flash("사건 등록 중 오류가 발생했습니다.", "danger")
-        return render_template(page), 500
+        return _form_page(registrar, 500)
 
+    logger.info("Case registered by an administrator: seal_id=%r admin=%s",
+                form["seal_id"][:200], registrar)
     flash("사건이 등록되었습니다.", "success")
     return redirect(url_for("investigator.register_case"))
 
@@ -236,7 +285,7 @@ def _password_errors(password: str) -> list[str]:
     return []
 
 
-def _case_registration(form: dict[str, str]) -> CaseRegistration:
+def _case_registration(form: dict[str, str], registrar: str) -> CaseRegistration:
     """The registration; a password is hashed only for a level that uses it."""
     stored_hash = (hash_case_password(form["password"])
                    if _uses_factor(form["auth_level"], "password") else "")
@@ -245,7 +294,7 @@ def _case_registration(form: dict[str, str]) -> CaseRegistration:
         investigator=form["investigator"], name=form["suspect_name"],
         email=form["suspect_email"], birth=form["suspect_birth"],
         phone=form["suspect_phone"], auth_level=form["auth_level"],
-        password_hash=stored_hash,
+        password_hash=stored_hash, registered_by=registrar,
     )
 
 
@@ -258,8 +307,15 @@ def upload_share() -> Any:
 
     Neither investigator recovery route reads it (both take s2 from the
     request); the admin emergency path may use it as its second share.
+    The share's format is checked first, then it is stored under the
+    seal's current policy generation (stage F, F1; :mod:`web.share_upload`):
+    400 for a malformed share, 409 when another share 2 is stored for that
+    generation, success when it is stored now or the identical share
+    already was.
     """
-    if request.method == "GET":
+    # GET and HEAD show the page; only a POST submits (stage F, F5:
+    # the CSRF hook lets HEAD through without a token).
+    if request.method != "POST":
         return render_template("upload_share.html")
 
     seal_id = (request.form.get("seal_id") or "").strip()
@@ -269,24 +325,15 @@ def upload_share() -> Any:
         flash("봉인 ID와 키 조각을 모두 입력해 주세요.", "danger")
         return render_template("upload_share.html"), 400
 
-    case = find_case_by_seal_id(seal_id)
-    if not case:
-        flash("해당 봉인 ID의 사건이 존재하지 않습니다.", "danger")
-        return render_template("upload_share.html"), 404
-
-    try:
-        insert_key_share(
-            seal_id=seal_id,
-            share_index=2,
-            share_data=share_data,
-            uploaded_by="investigator",
-        )
-    except Exception:
-        logger.exception("키 조각 업로드 실패")
-        flash("키 조각 업로드 중 오류가 발생했습니다.", "danger")
-        return render_template("upload_share.html"), 500
-
-    flash("수사관 키 조각이 업로드되었습니다.", "success")
+    share, reply = checked_share(share_data, 2)
+    if reply is None:
+        if not find_case_by_seal_id(seal_id):
+            flash("해당 봉인 ID의 사건이 존재하지 않습니다.", "danger")
+            return render_template("upload_share.html"), 404
+        reply = store_uploaded_share(seal_id, 2, share, "investigator")
+    flash(reply.message, reply.category)
+    if not reply.ok:
+        return render_template("upload_share.html"), reply.status
     return redirect(url_for("investigator.upload_share"))
 
 
@@ -307,7 +354,9 @@ def recover_key() -> Any:
     so a TSA outage does not block standard recovery. The entered share is
     never logged or audited.
     """
-    if request.method == "GET":
+    # GET and HEAD show the page; only a POST submits (stage F, F5:
+    # the CSRF hook lets HEAD through without a token).
+    if request.method != "POST":
         return render_template("recover_key.html")
 
     seal_id = (request.form.get("seal_id") or "").strip()
@@ -345,7 +394,9 @@ def recover_key_timelock() -> Any:
     master key and recombined (strict mode also needs the owner share).
     The entered share is never logged or audited.
     """
-    if request.method == "GET":
+    # GET and HEAD show the page; only a POST submits (stage F, F5:
+    # the CSRF hook lets HEAD through without a token).
+    if request.method != "POST":
         return render_template("recover_key_timelock.html")
 
     seal_id = (request.form.get("seal_id") or "").strip()

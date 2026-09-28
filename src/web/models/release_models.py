@@ -206,7 +206,11 @@ def seal_write_transaction(seal_id: str) -> Iterator[None]:
     IMMEDIATE``); MariaDB locks the parent case row (``FOR UPDATE``; a seal
     without a case row gets only a gap lock, and since E3b its record
     writers refuse it first, :class:`web.privacy.record_store.CaseNotRegistered`,
-    as the foreign key would). The writers below do not commit: this
+    as the foreign key would). Since stage F, F2 a signed record may create
+    the missing case inside this transaction (:mod:`web.sync_registration`);
+    two such first syncs holding the same gap lock (one seal, or two seal
+    IDs in one gap of the index) both reach the case insert, and on MariaDB
+    one of them fails and rolls back. The writers below do not commit: this
     commits on success and rolls back on any exception. A helper that
     commits by itself (``execute_query`` on a write) ends the transaction,
     and with it the lock, at that point.
@@ -569,35 +573,6 @@ def find_latest_wrapped_s3(seal_id: str) -> Optional[bytes]:
         return None
     value = row["wrapped_s3"] if hasattr(row, "keys") else row[0]
     return bytes(value)
-
-
-def find_stored_shares(seal_id: str) -> dict[int, str]:
-    """Submitted shares (``key_shares``) of a seal, keyed by slot index."""
-    rows = execute_query(
-        "SELECT share_index, share_data FROM key_shares WHERE seal_id = ?",
-        (seal_id,),
-        fetch_all=True,
-    ) or []
-    shares: dict[int, str] = {}
-    for row in rows:
-        index, data = ((row["share_index"], row["share_data"])
-                       if hasattr(row, "keys") else (row[0], row[1]))
-        shares[int(index)] = data
-    return shares
-
-
-def find_share_by_index(seal_id: str, share_index: int) -> Optional[str]:
-    """A submitted share (``key_shares``) by index, if present."""
-    row = execute_query(
-        """SELECT share_data FROM key_shares
-           WHERE seal_id = ? AND share_index = ?""",
-        (seal_id, share_index),
-        fetch_one=True,
-    )
-    if row is None:
-        return None
-    value = row["share_data"] if hasattr(row, "keys") else row[0]
-    return value or None
 
 
 def insert_release_audit(entry: ReleaseAuditEntry) -> int:

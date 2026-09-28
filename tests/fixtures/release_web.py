@@ -69,13 +69,22 @@ def ensure_case(app: Any, seal_id: str) -> None:
             )
 
 
-def store_share(app: Any, seal_id: str, index: int, share: str) -> None:
-    """Store a submitted share (s1 by the subject, s2 by the investigator)."""
+def store_share(
+    app: Any, seal_id: str, index: int, share: str, *,
+    generation: Optional[int] = None,
+) -> None:
+    """Store a submitted share (s1 by the subject, s2 by the investigator,
+    s4 out of band). ``generation`` tags it with a policy generation (stage
+    F, F1); without it, the v1.x call shape, the share is generation 0."""
     uploaded_by = {1: "suspect", 2: "investigator", 4: "admin"}[index]
     with app.app_context():
         from web.models.db_models import insert_key_share
 
-        insert_key_share(seal_id, index, share, uploaded_by)
+        if generation is None:
+            insert_key_share(seal_id, index, share, uploaded_by)
+        else:
+            insert_key_share(seal_id, index, share, uploaded_by,
+                             generation=generation)
 
 
 def sync_payload(

@@ -889,10 +889,10 @@ _TRANSLATIONS = {
 
     # About dialog
     "about.title": {"ko": "정보", "en": "About"},
-    "about.version": {"ko": "v1.1.0", "en": "v1.1.0"},
+    "about.version": {"ko": "v1.2.0", "en": "v1.2.0"},
     "about.desc": {
-        "ko": "디지털증거 전자봉인시스템\nv1.1.0\n\n형사절차에서 디지털증거 봉인 모델\n(박희원, 성균관대 2025)",
-        "en": "Electronic Sealing Scheme (SSS)\nv1.1.0\n\nResearch prototype for digital evidence",
+        "ko": "디지털증거 전자봉인시스템\nv1.2.0\n\n형사절차에서 디지털증거 봉인 모델\n(박희원, 성균관대 2025)",
+        "en": "Electronic Sealing Scheme (SSS)\nv1.2.0\n\nResearch prototype for digital evidence",
     },
 
     # Exit dialog

@@ -26,22 +26,23 @@ _TIME = "2026-08-02T00:00:00Z"
 
 def seal_through_process(
     tmp_path: Path, signer: Any, db_path: str, seal_id: str = E2E_SEAL_ID,
-    *, registered: bool = True,
+    *, registered: bool = True, seal_mode: str = "standard",
 ) -> Any:
     """S4, S6 and S7 of the real SealProcess; returns the SealResult."""
     return sealing_before_s7(tmp_path, signer, db_path, seal_id,
-                             registered=registered).run_s7()
+                             registered=registered, seal_mode=seal_mode).run_s7()
 
 
 def sealing_before_s7(
     tmp_path: Path, signer: Any, db_path: str, seal_id: str = E2E_SEAL_ID,
-    *, registered: bool = True,
+    *, registered: bool = True, seal_mode: str = "standard",
 ) -> Any:
     """The real SealProcess after S4 and S6 (S7 not run yet).
 
     ``registered`` passes ``seal_id`` as the ID of a case registered in the
     case manager (``SealConfig.seal_id``); otherwise S4 draws one itself
-    (``seal_id`` is then ignored).
+    (``seal_id`` is then ignored). ``seal_mode`` is the recovery regime
+    chosen at sealing (``"strict"`` needs the policy signer; stage F, F4).
     """
     import desktop.seal_process as sp
     from desktop.db import init_db
@@ -59,7 +60,7 @@ def sealing_before_s7(
                  "phone": "010-0000-0000", "participation": "yes",
                  "password": "pw"},
         signature_lines=[(0, 0, 1, 1)], unlock_days=0,
-        seal_id=seal_id if registered else None,
+        seal_id=seal_id if registered else None, seal_mode=seal_mode,
     ))
     process.state["s1"] = {
         "aes_key_hex": SEAL_KEY_HEX, "enc_filepath": str(enc),

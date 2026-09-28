@@ -10,7 +10,9 @@
             비상 복구
         </a>
 
-        {% if shares %}
+        {% if shares is none %}
+        <div class="alert alert-danger" role="alert">관리자 키 조각 목록을 읽을 수 없습니다. 잠시 후 다시 시도해 주세요.</div>
+        {% elif shares %}
         <div class="table-responsive">
             <table class="table table-bordered table-hover">
                 <caption class="visually-hidden">사건별 관리자 키 조각(키 조각 4) 목록</caption>
@@ -18,6 +20,7 @@
                     <tr>
                         <th scope="col">봉인 ID</th>
                         <th scope="col">조각 번호</th>
+                        <th scope="col">봉인 정책 세대</th>
                         <th scope="col">업로드 주체</th>
                         <th scope="col">업로드 시각</th>
                     </tr>
@@ -27,6 +30,7 @@
                     <tr>
                         <td>{{ share.seal_id }}</td>
                         <td>{{ share.share_index }}</td>
+                        <td>{{ share.generation }}</td>
                         <td>{{ share.uploaded_by }}</td>
                         <td>{{ share.uploaded_at }}</td>
                     </tr>
@@ -39,6 +43,109 @@
             등록된 관리자 키 조각이 없습니다.
             봉인 절차에서 키 조각 4가 배분되면 이 목록에 표시됩니다.
         </div>
+        {% endif %}
+
+        <h4 class="mt-5 mb-3">봉인별 저장 조각 조회와 삭제</h4>
+        <p class="text-muted">
+            조각 칸은 봉인 정책 세대마다 하나입니다. 현재 세대 칸에 잘못된 조각이 저장되어
+            올바른 조각이 거부되면, 여기서 그 조각을 삭제한 뒤 다시 업로드하게 할 수 있습니다.
+            삭제할 때마다 계정·사유·시각과 삭제한 조각의 SHA-256이 감사 기록에 남습니다.
+            조각 값은 화면에 나오지 않습니다.
+        </p>
+        <p class="text-muted">
+            어느 칸·세대의 조각이든 지울 수 있으므로, 잘못된 조각인지는 삭제하는 관리자가 확인해야 합니다.
+            지운 조각은 되살릴 수 없습니다(감사 기록에는 SHA-256만 남습니다). 웹에서 다시 올릴 수 있는 것은
+            현재 세대의 1번·2번 조각뿐입니다. 삭제는 이미 진행 중인 해제를 멈추지 않고, 이미 나간 조각이나 키를
+            회수하지도 않습니다. 화면을 연 뒤 그 칸의 조각이 바뀌었으면 삭제하지 않습니다.
+        </p>
+        <form method="get" action="{{ url_for('admin.shares') }}" class="row g-2 mb-3">
+            <div class="col-auto">
+                <label for="seal-lookup" class="visually-hidden">봉인 ID</label>
+                <input type="text" id="seal-lookup" name="seal_id" class="form-control"
+                       maxlength="64" placeholder="봉인 ID" value="{{ seal_id }}">
+            </div>
+            <div class="col-auto">
+                <button type="submit" class="btn btn-outline-secondary">조회</button>
+            </div>
+        </form>
+
+        {% if seal_id %}
+        {% if seal_shares is none %}
+        <div class="alert alert-danger" role="alert">봉인 {{ seal_id }}의 저장 조각을 읽을 수 없습니다. 잠시 후 다시 시도해 주세요.</div>
+        {% elif seal_shares %}
+        <div class="table-responsive">
+            <table class="table table-bordered table-hover">
+                <caption class="visually-hidden">봉인 {{ seal_id }}의 저장 조각</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">조각 번호</th>
+                        <th scope="col">봉인 정책 세대</th>
+                        <th scope="col">업로드 주체</th>
+                        <th scope="col">업로드 시각</th>
+                        <th scope="col">삭제(사유 필수)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for share in seal_shares %}
+                    <tr>
+                        <td>{{ share.index }}</td>
+                        <td>{{ share.generation }}</td>
+                        <td>{{ share.uploaded_by }}</td>
+                        <td>{{ share.uploaded_at }}</td>
+                        <td>
+                            <form method="post" action="{{ url_for('admin.remove_share') }}" class="d-flex gap-2">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <input type="hidden" name="seal_id" value="{{ seal_id }}">
+                                <input type="hidden" name="share_index" value="{{ share.index }}">
+                                <input type="hidden" name="generation" value="{{ share.generation }}">
+                                <input type="hidden" name="share_row_id" value="{{ share.row_id }}">
+                                <label for="reason-{{ share.row_id }}" class="visually-hidden">삭제 사유</label>
+                                <input type="text" id="reason-{{ share.row_id }}" name="reason" class="form-control form-control-sm"
+                                       maxlength="2000" required placeholder="삭제 사유">
+                                <button type="submit" class="btn btn-sm btn-outline-danger">삭제</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="alert alert-secondary" role="alert">봉인 {{ seal_id }}에 저장된 조각이 없습니다.</div>
+        {% endif %}
+
+        {% if removals is none %}
+        <div class="alert alert-danger mt-4" role="alert">조각 삭제 기록을 읽을 수 없습니다. 관리자에게 문의해 주세요.</div>
+        {% elif removals %}
+        <h5 class="mt-4">삭제 기록</h5>
+        <div class="table-responsive">
+            <table class="table table-sm table-bordered">
+                <caption class="visually-hidden">봉인 {{ seal_id }}의 조각 삭제 기록</caption>
+                <thead>
+                    <tr>
+                        <th scope="col">삭제 시각</th>
+                        <th scope="col">계정</th>
+                        <th scope="col">조각 번호</th>
+                        <th scope="col">세대</th>
+                        <th scope="col">사유</th>
+                        <th scope="col">삭제한 조각의 SHA-256</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for removal in removals %}
+                    <tr>
+                        <td>{{ removal.removed_at }}</td>
+                        <td>{{ removal.operator }}</td>
+                        <td>{{ removal.share_index }}</td>
+                        <td>{{ removal.generation }}</td>
+                        <td>{{ removal.reason }}</td>
+                        <td><code>{{ removal.share_sha256[:16] }}…</code></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
         {% endif %}
     </div>
 </div>

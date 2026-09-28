@@ -108,6 +108,10 @@ upstream license are provided under
 - Python 3.12 or newer
 - Windows 10/11 for the primary desktop workflow
 - macOS or Linux for non-GUI tests and selected tooling
+- For the web application on MariaDB: MariaDB 10.2.4 or newer (tested with
+  11.8). The share removal's check against a stale page relies on row ids
+  never being reused, which InnoDB's auto-increment counter guarantees
+  across restarts only from 10.2.4.
 
 Create an isolated environment and install the declared dependencies:
 
@@ -223,6 +227,68 @@ limited per client address (`CASE_REGISTRATION_MAX_PER_ADDRESS` within
 `CASE_PASSWORD_MAX_CONCURRENT` case-password checks (default 4) run at once
 in each worker process; further ones are refused with 503.
 
+A case is registered in one of two ways. A sync submission whose envelope
+verifies and whose record carries a policy that verifies against the
+pinned CA for the same seal (not one whose certificate has since expired)
+creates the seal's case from the record when none exists: the case number
+and investigator from `case_info`, and the subject's name, birth date,
+phone and e-mail from `signer_info`, protected like every registration,
+with the authentication level `SYNC_CASE_AUTH_LEVEL` (`basic`, the
+default, or `basic+otp`, which then needs the record's e-mail; any other
+value stops the application at start-up). Such a case has no case password,
+and the three basic factors (name, birth date and phone) are the record's
+own `signer_info`, known to whoever holds the record or its PDF; a
+deployment that can send mail should set `SYNC_CASE_AUTH_LEVEL=basic+otp`.
+After the checks every
+submission passes first (format, signature, binding and policy, which can
+answer 400, 401, 422 or 503), a record that could create the case but
+whose required values are missing or too long is refused with 422 and
+creates nothing, and any other submission for a seal without a case is
+refused with 404. The
+registration form (`/investigator/register-case`) needs a signed-in
+administrator; use it for seals whose records are not signed. Either way
+`cases.registered_by` records who registered the case: the
+administrator's account name, or `sync:` and the first 16 hex digits of
+the SHA-256 fingerprint of the certificate that signed the record's
+envelope.
+
+Uploaded key shares are kept per policy generation. Each upload of share 1
+(by the authenticated subject) or share 2 (by the investigator) is stored
+for the generation of the seal's newest authenticated policy (0 when the
+seal has none), one share per slot and generation: the same share again is
+reported as already stored, and a different share for that generation is
+refused (409) with a message naming the generation. After a reseal whose
+record carries an authenticated policy of the next generation, the new
+share therefore has its own slot once that record has been synchronized;
+a share uploaded before that is stored for the earlier generation, and is
+refused if that slot is taken. A seal without an authenticated policy stays
+at generation 0, so there a resealed share cannot be stored while the
+earlier one is (as in v1.1). When a release rests on an authenticated
+policy, it tries the stored shares of that policy's generation first, then
+those of the other generations, highest first, and returns a key only when
+it matches that policy's key commitment. Without an authenticated policy,
+the standard path checks the record's own (unauthenticated) key commitment
+in the same way, and the administrator's emergency path uses only
+generation-0 shares and, as in v1.1, releases without a commitment to
+check (flagged). The standard-mode time-locked path uses no stored share
+(the presented share 2 and the wrapped share 3). Databases from earlier
+versions are migrated at start-up; their stored shares count as generation
+0. A share stored out of band (for example the administrator's share 4)
+must be given the generation of the policy it belongs to.
+
+A stored share is never replaced by an upload. When a wrong share was
+stored first in the slot of the seal's current generation (for example the
+earlier generation's share uploaded after the reseal), an administrator
+removes it from the share list of that seal (`/admin/shares?seal_id=...`,
+a reason is required), and the right share can then be uploaded. Each
+removal writes a row to `share_removal_audit` with the account, the
+reason, the time and the SHA-256 of the removed share (not the share),
+in the same transaction as the removal: when that row cannot be written,
+nothing is removed. The form names the stored row the administrator saw;
+when another share occupies the slot by then (a stale page, or a repeated
+request after the right share was uploaded again), nothing is removed
+(409).
+
 Synced seal records and their PDFs are
 stored encrypted under the seal's data key (AES-256-GCM, bound to the seal,
 the event and the column); the subject's record view and PDF download
@@ -274,14 +340,16 @@ python -m desktop.sync retry
 On the web application, `SYNC_REQUIRE_SIGNATURE=true` refuses unsigned
 submissions (it needs `POLICY_CA_CERT_PATH`); a present but invalid
 signature is always refused. `SYNC_SIGNATURE_WINDOW_SECONDS` (default 300,
-30 to 3600) bounds the clock distance of a signed submission. Seal policies
+30 to 3600) bounds the clock distance of a signed submission, and
+`SYNC_CASE_AUTH_LEVEL` (default `basic`) is the authentication level of a
+case created by its signed record. Seal policies
 carry a generation (sealing 1, each reseal the previous + 1), and the web
 application refuses an older generation of a seal once it has admitted a
 newer one. The switch is off by default, and the properties that rest on
 who submitted a record hold only with it on: with it off, anyone can
 submit unsigned records (see the limitations below).
 
-## Known limitations of v1.1
+## Known limitations of v1.2
 
 - **Synchronization is authenticated only with `SYNC_REQUIRE_SIGNATURE=true`.**
   Both protective switches, this one and `RELEASE_REQUIRE_POLICY`, are off
@@ -296,32 +364,68 @@ submit unsigned records (see the limitations below).
   authenticated policy can still be released on its unauthenticated records
   (the standard path then needs the record's key commitment, and the admin
   path flags the release).
-- **Share slots are not versioned by reseal.** Each share slot keeps the
-  first share stored for it. If share 1 of an earlier generation was
-  uploaded, the resealed share 1 cannot be uploaded, and the paths that
-  combine the stored share 1 with the new policy (the standard path and the
-  strict time-locked path) end in a commitment mismatch. The standard-mode
-  time-locked path uses the presented share 2 and the wrapped share 3 and is
-  not affected; the admin path is not a documented remedy.
-- **Case registration is unauthenticated and can be pre-empted.** A seal's
-  records are accepted only after its case is registered. Whoever learns a
-  seal id first can register the case with their own identity values; the
-  genuine registration is then refused, and the seal's identity binding
-  and data key belong to that registration.
+- **Share uploads follow the order of synchronization and tell the seal's
+  generation.** A share is stored for the generation current at upload, not
+  for the key it belongs to: a resealed share uploaded before the resealing
+  record is synchronized is refused (409) when the earlier generation's slot
+  is filled, and the key commitment decides which stored share opens a
+  release. Generations need authenticated policies: on a seal without one
+  (a desktop without the institutional seal-policy key, or a web
+  application without its CA) every share is generation 0, and after a
+  reseal the new share 1 cannot be uploaded while the earlier one is
+  stored. A refused upload names the seal's current policy generation, and
+  the unauthenticated upload of share 2 is still first-come for each
+  generation; share 2 is used only by the administrator's emergency
+  recovery. A wrong share stored first for the current generation blocks
+  the right one until an administrator removes it (audited); an upload
+  never replaces a stored share. Stored shares stay in plaintext
+  application data, and only that removal deletes one.
+- **The share removal is an administrator's decision, not a check.** Any
+  enabled administrator can remove any stored share: any slot, share 4
+  included, and any generation. Whether a share is wrong is that
+  administrator's judgment. The audit keeps the removed share's SHA-256,
+  not the share, and the web accepts again only shares 1 and 2 of the
+  seal's current generation: a removed share 4, or a removed share of an
+  earlier generation, comes back only from a copy kept elsewhere and
+  stored out of band. A removal does not stop a release already in
+  progress (one that has read the stored shares completes) and does not
+  revoke shares or keys already handed out. It frees the slot but does not
+  stop the same or another wrong share from being uploaded again: whoever
+  can upload share 1 (under `basic`, anyone holding the record or its PDF)
+  can block the slot again, so the genuine share should be uploaded right
+  after the removal, and `basic+otp` narrows who can upload.
+- **Case creation trusts the first signed record.** A signed record
+  creates its case only when the desktop holds the institutional
+  seal-policy key and the web application pins its CA; other deployments
+  register cases with the administrator's form before the first sync. An
+  existing case is used as it is: later records are not compared with its
+  identity, and an administrator can still register a seal id with other
+  identity values before its signed record arrives. On MariaDB, two first
+  syncs at the same moment (of one seal, or of two new seal ids next to
+  each other in the index) can collide; the one refused is answered 503
+  and stays queued on the desktop until `python -m desktop.sync retry` or
+  the seal's next push sends it again. This assumes InnoDB's deadlock
+  detection (`innodb_deadlock_detect`, on by default); with it off, the
+  refused submission waits for the lock wait timeout first. Any event type
+  can create the case: if a later event (a reseal of generation 2) reaches
+  the web first and creates it, the earlier record that follows is refused
+  as a rollback of its generation (409), and that seal's queued records
+  stop until an operator intervenes.
 - **The identity-protection keys are required.** The web application does
   not start without them; a key file lost later makes registration, subject
   authentication and synchronization answer 503 and denies every release on
   a seal with records. There is no key rotation: replacing the identity
   pepper, the privacy master key or the release master key makes what it
   protects unusable.
-- **Seal ids are coordinated by hand.** The case is registered on the web
-  under the seal id the desktop generated; the desktop's daily id space is
-  24 bits (`S-YYYYMMDD-` and six hexadecimal digits).
+- **Seal ids come from the desktop.** A signed record creates its case
+  under the seal id the desktop generated; an administrator who registers
+  a case by hand must use that id. The desktop's daily id space is 24
+  bits (`S-YYYYMMDD-` and six hexadecimal digits).
 - **Plaintext outside the web tables.** The desktop database and its sync
   outbox keep records and PDFs in plaintext. Converting an older web
   database removes plaintext from its tables, but copies can remain in
   backups, in MariaDB logs and pages, and in earlier logs.
-- **The separately operated portal is unchanged** by v1.1. The desktop's
+- **The separately operated portal is unchanged** by v1.1 and v1.2. The desktop's
   portal backend conforms to the portal's interface contract document; the
   portal's acceptance, storage, idempotence and generation handling were
   not tested.
@@ -335,10 +439,21 @@ submit unsigned records (see the limitations below).
   only when no other connection is open. Investigators have no accounts
   and no record view.
 - **Evidence behind this release.** The automated test results are the
-  developers' runs (Windows host and a MariaDB container). Independent
-  reviews of the release candidate were static reviews of the source; one
-  of them did not include the GUI wizard modules, `db_models.py` and
-  `pdf_signer.py`.
+  developers' runs: a Windows host (SQLite), a Linux container (SQLite,
+  without the GUI modules) and a MariaDB 11.8 container; the counts are in
+  each release's notes. The independent reviews were static reviews by two
+  AI models commissioned by the authors, reading frozen snapshots at named
+  commits without running tests. For v1.2, one model was given the whole
+  source and tests in each round. The other read a selection: the web
+  release, share, synchronization, administration, privacy and database
+  modules, the desktop case store, and the desktop's sync envelope, seal
+  policy and strict key-splitting modules, with the new tests. It did not
+  read the desktop sync client, the seal and reseal processes, the
+  synchronization schema module, the GUI or most test fixtures, and its
+  re-check of the share removal was limited to the removal, the modules it
+  relies on, its tests and this README. Neither review covered the
+  separately operated portal. For v1.1, one review did not include the GUI
+  wizard modules, `db_models.py` and `pdf_signer.py`.
 - **The bundled RFC 3161 responder is a reference component** with a
   placeholder policy OID; a deployment needs a TSA whose default policy is
   the pinned OID.

@@ -7,8 +7,11 @@ Tables: ``seal_data_keys`` and ``identity_access_audit`` (DDL in
 
 No function here writes a plaintext identity value: a new case row gets
 '' in ``suspect_name``, ``suspect_email``, ``suspect_birth`` and
-``suspect_phone``, and ``identity_scheme = 'v1'``. Rows are read with
-explicit column lists and mapped by position (MariaDB returns tuples).
+``suspect_phone``, and ``identity_scheme = 'v1'``. Since stage F, F2 it
+also records who registered it (``registered_by``: an administrator's
+username, or ``sync:...`` for a case created by its signed record). Rows
+are read with explicit column lists and mapped by position (MariaDB
+returns tuples).
 The access audit is application-level: no helper updates or deletes its
 rows, but the database does not enforce append-only behaviour.
 """
@@ -45,8 +48,9 @@ _INSERT_CASE = """INSERT INTO cases
     (seal_id, case_number, investigator, suspect_name, suspect_email,
      suspect_birth, suspect_phone, auth_level, password_hash,
      suspect_name_digest, suspect_birth_digest, suspect_phone_digest,
-     suspect_name_enc, suspect_email_enc, identity_scheme)
-    VALUES (?, ?, ?, '', '', '', '', ?, ?, ?, ?, ?, ?, ?, ?)"""
+     suspect_name_enc, suspect_email_enc, identity_scheme, registered_by)
+    VALUES (?, ?, ?, '', '', '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+_CASE_EXISTS = "SELECT 1 FROM cases WHERE seal_id = ?"
 INSERT_DATA_KEY = (
     "INSERT INTO seal_data_keys (seal_id, wrapped_key, created_at) VALUES (?, ?, ?)"
 )
@@ -82,6 +86,13 @@ _COUNT_RECENT_ACCESS = (
 )
 
 
+class CaseInsertError(Exception):
+    """The ``cases`` row itself could not be inserted; the driver's error is
+    the ``__cause__``. Raised for that statement only (not for the data key
+    insert), so a caller can tell a concurrent insert of the same seal from
+    another fault (stage F, F2)."""
+
+
 @dataclass(frozen=True)
 class ProtectedIdentity:
     """The stored form of a subject's identity: digests and ciphertexts."""
@@ -103,6 +114,7 @@ class NewCase:
     auth_level: str
     password_hash: str = field(repr=False)
     identity: ProtectedIdentity = field(default_factory=ProtectedIdentity)
+    registered_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,26 +165,62 @@ def insert_protected_case(case: NewCase, wrapped_key: bytes, created_at: str) ->
 
     Any error rolls back both inserts, so a case never exists without its
     data key.
+
+    Raises:
+        CaseInsertError: The case row's insert failed (rolled back), for
+            example because the seal has a case by now.
     """
     db = get_db()
-    cursor = db.cursor()
+    try:
+        case_id = insert_protected_case_uncommitted(case, wrapped_key, created_at)
+        db.commit()
+        return case_id
+    except Exception:
+        db.rollback()
+        raise
+
+
+def insert_protected_case_uncommitted(
+    case: NewCase, wrapped_key: bytes, created_at: str
+) -> int:
+    """Insert the case row and its wrapped data key without committing.
+
+    For a caller inside ``seal_write_transaction`` (stage F, F2: the case a
+    signed record creates), whose transaction commits both rows with the
+    record or rolls all of them back. Returns the case row id.
+
+    Raises:
+        CaseInsertError: The case row's insert failed (for example the seal
+            already has a case, or a concurrent insert of it won).
+    """
+    cursor = get_db().cursor()
+    try:
+        case_id = _insert_case_row(cursor, case)
+        cursor.execute(dialect_sql(INSERT_DATA_KEY),
+                       (case.seal_id, wrapped_key, created_at))
+        return case_id
+    finally:
+        cursor.close()
+
+
+def _insert_case_row(cursor: Any, case: NewCase) -> int:
+    """The case row's own insert; its failure is :class:`CaseInsertError`."""
     try:
         cursor.execute(dialect_sql(_INSERT_CASE), (
             case.seal_id, case.case_number, case.investigator, case.auth_level,
             case.password_hash, case.identity.name_digest,
             case.identity.birth_digest, case.identity.phone_digest,
             case.identity.name_enc, case.identity.email_enc, IDENTITY_SCHEME_V1,
+            case.registered_by,
         ))
-        case_id = cursor.lastrowid
-        cursor.execute(dialect_sql(INSERT_DATA_KEY),
-                       (case.seal_id, wrapped_key, created_at))
-        db.commit()
-        return case_id
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        cursor.close()
+    except Exception as exc:
+        raise CaseInsertError("the case row was not inserted") from exc
+    return cursor.lastrowid
+
+
+def case_exists(seal_id: str) -> bool:
+    """Whether the seal has a case row (no identity column is read)."""
+    return execute_query(_CASE_EXISTS, (seal_id,), fetch_one=True) is not None
 
 
 def find_case_identity(seal_id: str) -> Optional[CaseIdentityRow]:

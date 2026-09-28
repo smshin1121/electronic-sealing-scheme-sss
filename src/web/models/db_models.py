@@ -10,12 +10,15 @@ import json
 import logging
 import re
 import sqlite3
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flask import Flask, g
 
 from .migrations import apply_migrations
 from .privacy_schema import MARIADB_PRIVACY_SCHEMA, SQLITE_PRIVACY_SCHEMA
+
+if TYPE_CHECKING:
+    from .share_models import ShareWrite
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +54,8 @@ CREATE TABLE IF NOT EXISTS cases (
     suspect_phone_digest TEXT NOT NULL DEFAULT '',
     suspect_name_enc     TEXT NOT NULL DEFAULT '',
     suspect_email_enc    TEXT NOT NULL DEFAULT '',
-    identity_scheme      TEXT NOT NULL DEFAULT ''
+    identity_scheme      TEXT NOT NULL DEFAULT '',
+    registered_by        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -73,8 +77,9 @@ CREATE TABLE IF NOT EXISTS key_shares (
     share_data  TEXT    NOT NULL,
     uploaded_by TEXT    NOT NULL,
     uploaded_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    generation  INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (seal_id) REFERENCES cases(seal_id),
-    UNIQUE(seal_id, share_index)
+    UNIQUE(seal_id, share_index, generation)
 );
 
 CREATE TABLE IF NOT EXISTS seal_records (
@@ -171,7 +176,8 @@ CREATE TABLE IF NOT EXISTS cases (
     suspect_phone_digest VARCHAR(64) NOT NULL DEFAULT '',
     suspect_name_enc     TEXT        NOT NULL DEFAULT '',
     suspect_email_enc    TEXT        NOT NULL DEFAULT '',
-    identity_scheme      VARCHAR(16) NOT NULL DEFAULT ''
+    identity_scheme      VARCHAR(16) NOT NULL DEFAULT '',
+    registered_by        VARCHAR(64) NOT NULL DEFAULT ''
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS users (
@@ -193,8 +199,9 @@ CREATE TABLE IF NOT EXISTS key_shares (
     share_data   TEXT        NOT NULL,
     uploaded_by  VARCHAR(128) NOT NULL,
     uploaded_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    generation   INT         NOT NULL DEFAULT 0,
     FOREIGN KEY (seal_id) REFERENCES cases(seal_id),
-    UNIQUE KEY uq_seal_share (seal_id, share_index)
+    UNIQUE KEY uq_seal_share_generation (seal_id, share_index, generation)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS seal_records (
@@ -446,7 +453,9 @@ def insert_case(
     keyed digests (name, birth date, phone) and ciphertexts (name, e-mail)
     under a new per-seal data key and leaves the plaintext columns ''.
     It therefore needs the identity-protection keys. ``password_hash`` is
-    stored as given.
+    stored as given. ``registered_by`` stays '': the two registration
+    paths of stage F, F2 (an administrator's form, a signed record) record
+    who registered the case; this helper is neither.
 
     Returns:
         The inserted row ID.
@@ -481,31 +490,32 @@ def insert_key_share(
     share_index: int,
     share_data: str,
     uploaded_by: str,
-) -> int | None:
-    """Insert or ignore a key share.
+    *,
+    generation: int = 0,
+) -> ShareWrite:
+    """Store a key share for one policy generation (stage F, F1).
+
+    A slot holds one share per generation. The v1.x call shape (no
+    ``generation``) stores generation 0, the generation every share stored
+    before F1 was given. The upload routes pass the seal's current
+    generation (:mod:`web.share_upload`); a share stored out of band after
+    a reseal (for example s4) needs ``generation=G`` of the resealing
+    policy. Nothing is ignored silently any more.
 
     Returns:
-        The inserted row ID, or None if duplicate.
+        A :class:`web.models.share_models.ShareWrite`: ``outcome`` is
+        ``"stored"`` (with ``row_id``), ``"identical"`` (the same share is
+        already stored for that generation) or ``"conflict"`` (another
+        share is); nothing is written in the last two cases.
+
+    Raises:
+        ValueError: ``share_index`` is not 1 to 4, or ``generation`` is
+            not an int from 0 to 2^31 - 1.
     """
-    db = get_db()
-    db_type = g.get("db_type", "sqlite")
+    from .share_models import store_key_share
 
-    if db_type == "sqlite":
-        sql = """INSERT OR IGNORE INTO key_shares
-                 (seal_id, share_index, share_data, uploaded_by)
-                 VALUES (?, ?, ?, ?)"""
-    else:
-        sql = """INSERT IGNORE INTO key_shares
-                 (seal_id, share_index, share_data, uploaded_by)
-                 VALUES (%s, %s, %s, %s)"""
-
-    cursor = db.cursor()
-    try:
-        cursor.execute(sql, (seal_id, share_index, share_data, uploaded_by))
-        db.commit()
-        return cursor.lastrowid
-    finally:
-        cursor.close()
+    return store_key_share(seal_id, share_index, share_data, uploaded_by,
+                           generation=generation)
 
 
 def find_key_shares_by_seal_id(seal_id: str) -> list[Any]:
@@ -682,12 +692,15 @@ def find_admin_share_summaries() -> list[Any]:
 
     Returns:
         List of row dicts/tuples with
-        (id, seal_id, share_index, uploaded_by, uploaded_at).
+        (id, seal_id, share_index, uploaded_by, uploaded_at, generation);
+        ``generation`` (stage F, F1) is the policy generation the share
+        was stored for.
     """
     return execute_query(
-        """SELECT id, seal_id, share_index, uploaded_by, uploaded_at
+        """SELECT id, seal_id, share_index, uploaded_by, uploaded_at,
+                  generation
            FROM key_shares WHERE share_index = 4
-           ORDER BY uploaded_at DESC""",
+           ORDER BY uploaded_at DESC, id DESC""",
         fetch_all=True,
     ) or []
 

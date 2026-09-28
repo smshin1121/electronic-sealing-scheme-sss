@@ -74,14 +74,19 @@ def sent(monkeypatch) -> list[tuple[str, str]]:
 
 
 def _register(client: Any, seal_id: str, **overrides: str) -> None:
+    """Register through the form from a separate administrator's client
+    (stage F, F2), so ``client`` stays an unauthenticated visitor."""
     form = {
         "seal_id": seal_id, "case_number": "2026-E3A-AUTH", "investigator": "수사관A",
         "suspect_name": NAME, "suspect_email": EMAIL, "suspect_birth": BIRTH,
         "suspect_phone": PHONE, "auth_level": "basic",
     }
     form.update(overrides)
-    resp = post_form(client, "/investigator/register-case", form)
+    admin = client.application.test_client()
+    login_admin(admin)
+    resp = post_form(admin, "/investigator/register-case", form)
     assert resp.status_code == 302, resp.get_data(as_text=True)
+    assert resp.headers["Location"].endswith("/investigator/register-case")
 
 
 def _auth(client: Any, seal_id: str, name: str = NAME, birth: str = BIRTH,
