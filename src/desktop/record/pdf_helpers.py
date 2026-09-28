@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -97,8 +98,12 @@ def create_styles() -> PdfStyles:
 # ---------------------------------------------------------------------------
 
 
-def create_document(output_path: str) -> SimpleDocTemplate:
-    """Create a standard A4 document with consistent margins."""
+def create_document(output_path: str, keywords: str = "") -> SimpleDocTemplate:
+    """Create a standard A4 document with consistent margins.
+
+    ``keywords`` goes to the document information (``/Keywords``); the
+    sealing record carries its record digest there.
+    """
     return SimpleDocTemplate(
         output_path,
         pagesize=A4,
@@ -106,6 +111,7 @@ def create_document(output_path: str) -> SimpleDocTemplate:
         rightMargin=20 * mm,
         topMargin=25 * mm,
         bottomMargin=25 * mm,
+        keywords=keywords,
     )
 
 
@@ -117,6 +123,19 @@ def create_document(output_path: str) -> SimpleDocTemplate:
 def p(text: str, style: ParagraphStyle) -> Paragraph:
     """Create a Paragraph from text, coercing to str."""
     return Paragraph(str(text), style)
+
+
+def mono(value: object, size: int = 8) -> str:
+    """Paragraph markup for a machine value (hash, time, mode).
+
+    ASCII values are set in Courier, a standard font whose text stays
+    literal (readable and searchable) in the PDF; other text keeps the
+    paragraph font, which has the Hangul glyphs. The value is escaped.
+    """
+    text = escape(str(value))
+    if not text.isascii():
+        return text
+    return f'<font name="Courier" size="{size}">{text}</font>'
 
 
 # ---------------------------------------------------------------------------
@@ -238,16 +257,27 @@ def add_signer_info_section(
     record: dict,
     width: float,
     styles: PdfStyles,
+    *,
+    show_fingerprint: bool = False,
 ) -> None:
-    """Append the signer info (서명자 정보) section."""
+    """Append the signer info (서명자 정보) section.
+
+    ``show_fingerprint`` adds the signing certificate's SHA-256 fingerprint
+    (the sealing record, whose PDF that certificate signs).
+    """
     sgn = record.get("signer_info", {})
-    story.append(p("서명자 정보", styles.h2))
-    story.append(kv_table([
+    rows = [
         ("성명", sgn.get("name", "")),
         ("이메일", sgn.get("email", "")),
         ("생년월일", sgn.get("birth_date", "")),
         ("연락처", sgn.get("phone", "")),
-    ], width, styles))
+    ]
+    if show_fingerprint:
+        rows.append(
+            ("인증서 지문 (SHA-256)", mono(sgn.get("cert_fingerprint") or "(미기록)"))
+        )
+    story.append(p("서명자 정보", styles.h2))
+    story.append(kv_table(rows, width, styles))
 
 
 # ---------------------------------------------------------------------------

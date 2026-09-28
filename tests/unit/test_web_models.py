@@ -2,7 +2,7 @@
 
 Covers:
   - init_db() table creation (cases, users, key_shares, seal_records)
-  - Case insert -> find round-trip
+  - Case insert -> find round-trip (identity stored protected, stage E E3a)
   - Key share insert -> find
   - Seal record insert -> idempotent duplicate handling
 """
@@ -103,8 +103,15 @@ class TestCaseCRUD:
             assert row is not None
             assert row["seal_id"] == "S-CRUD-001"
             assert row["case_number"] == "2025-TEST-01"
-            assert row["suspect_name"] == "홍길동"
             assert row["auth_level"] == "basic+password"
+            assert row["password_hash"] == "abc123hash"  # public-test-fixture
+            # Stage E (E3a): the identity is stored protected, never as given.
+            for column in ("suspect_name", "suspect_email",
+                           "suspect_birth", "suspect_phone"):
+                assert row[column] == ""
+            assert row["identity_scheme"] == "v1"
+            assert row["suspect_name_enc"].startswith("e1:")
+            assert len(row["suspect_phone_digest"]) == 64
 
     def test_find_nonexistent(self, app: Any) -> None:
         with app.app_context():

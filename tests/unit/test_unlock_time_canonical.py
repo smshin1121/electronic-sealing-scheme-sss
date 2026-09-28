@@ -180,6 +180,18 @@ class TestDerivedRecordsCarryForward:
 class TestSealProcessOrdering:
     """S4 fixes the policy; S6 reads it; S7 stores the signed record."""
 
+    @pytest.fixture(autouse=True)
+    def _synthetic_master_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # S6 wraps shares 3 and 4 under the master key; use a synthetic one
+        # (this test used to fall back to the operator's default key).
+        from desktop.crypto.local_kms import init_master_key
+
+        path = tmp_path / "master.key"
+        init_master_key(str(path))
+        monkeypatch.setenv("MASTER_KEY_PATH", str(path))
+
     def _process(self, tmp_path: Path, unlock_days: int = 7) -> Any:
         import desktop.seal_process as sp
 

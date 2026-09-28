@@ -1,7 +1,9 @@
-"""Self-signed CA and TSA certificate issuance.
+"""Self-signed CA, TSA and seal-policy certificate issuance.
 
 Creates a root CA key pair and certificate, then issues TSA-specific
-certificates with the id-kp-timeStamping extended key usage.
+certificates with the id-kp-timeStamping extended key usage and
+institutional seal-policy certificates with the dedicated seal-policy
+extended key usage (see :mod:`desktop.signature.seal_policy`).
 """
 
 from __future__ import annotations
@@ -18,13 +20,19 @@ from cryptography.x509 import Certificate, CertificateBuilder, Name, NameAttribu
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from .exceptions import CertificateError
+from .seal_policy import SEAL_POLICY_EKU_OID
 
 logger = logging.getLogger(__name__)
 
 _CA_VALIDITY_DAYS = 3650  # 10 years
 _TSA_VALIDITY_DAYS = 365  # 1 year
+# A seal policy may be released years after sealing and the release host
+# checks the certificate at release time, so the policy certificate lives
+# as long as its CA allows (capped at the CA's own notAfter).
+_POLICY_VALIDITY_DAYS = 3650
 _CA_KEY_SIZE = 4096
 _TSA_KEY_SIZE = 2048
+_POLICY_KEY_SIZE = 3072
 
 
 def create_ca(
@@ -212,6 +220,112 @@ def issue_tsa_cert(
         raise
     except Exception as exc:
         raise CertificateError(f"Failed to issue TSA certificate: {exc}") from exc
+
+
+def issue_policy_cert(
+    ca_key: RSAPrivateKey,
+    ca_cert: Certificate,
+    policy_subject: str = "Digital Evidence Sealing Policy Signer",
+    validity_days: int = _POLICY_VALIDITY_DAYS,
+) -> tuple[RSAPrivateKey, Certificate]:
+    """Issue the institutional seal-policy signing certificate.
+
+    The certificate is an end entity (``cA=FALSE``) whose critical
+    extended key usage is exactly the seal-policy purpose
+    (:data:`~desktop.signature.seal_policy.SEAL_POLICY_EKU_OID`); release
+    hosts accept a policy only from such a certificate issued by their
+    pinned CA.
+
+    Args:
+        ca_key: CA private key for signing the certificate.
+        ca_cert: CA certificate (issuer name and validity cap).
+        policy_subject: Common name of the policy signer.
+        validity_days: Requested validity, capped at the CA's notAfter.
+
+    Returns:
+        Tuple of (policy private key, policy certificate).
+
+    Raises:
+        CertificateError: If issuance fails or the validity is invalid.
+    """
+    if validity_days <= 0:
+        raise CertificateError("Policy certificate validity must be positive")
+    try:
+        key = rsa.generate_private_key(
+            public_exponent=65537, key_size=_POLICY_KEY_SIZE,
+        )
+        now = datetime.now(timezone.utc)
+        not_after = min(
+            now + timedelta(days=validity_days), ca_cert.not_valid_after_utc
+        )
+        cert = _build_policy_certificate(
+            key, ca_key, ca_cert, policy_subject, now, not_after
+        )
+        logger.info("Seal-policy certificate issued for subject='%s'",
+                    policy_subject)
+        return key, cert
+    except Exception as exc:
+        raise CertificateError(
+            f"Failed to issue seal-policy certificate: {exc}"
+        ) from exc
+
+
+def _build_policy_certificate(
+    key: RSAPrivateKey,
+    ca_key: RSAPrivateKey,
+    ca_cert: Certificate,
+    policy_subject: str,
+    not_before: datetime,
+    not_after: datetime,
+) -> Certificate:
+    """End-entity certificate whose only (critical) EKU is seal policy."""
+    subject = Name([
+        NameAttribute(NameOID.COMMON_NAME, policy_subject),
+        NameAttribute(NameOID.ORGANIZATION_NAME, "Electronic Sealing Scheme (SSS)"),
+        NameAttribute(NameOID.COUNTRY_NAME, "KR"),
+    ])
+    return (
+        CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None), critical=True,
+        )
+        .add_extension(_policy_key_usage(), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([SEAL_POLICY_EKU_OID]), critical=True,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                ca_key.public_key()
+            ),
+            critical=False,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+
+
+def _policy_key_usage() -> x509.KeyUsage:
+    """digitalSignature + nonRepudiation only (no certificate signing)."""
+    return x509.KeyUsage(
+        digital_signature=True,
+        content_commitment=True,
+        key_encipherment=False,
+        data_encipherment=False,
+        key_agreement=False,
+        key_cert_sign=False,
+        crl_sign=False,
+        encipher_only=False,
+        decipher_only=False,
+    )
 
 
 def save_tsa_credentials(

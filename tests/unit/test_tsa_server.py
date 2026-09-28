@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import re
 import time
 from datetime import datetime, timezone
 
@@ -45,6 +46,19 @@ pytestmark = pytest.mark.skipif(
 
 _TEST_TSA_KEY_PASSWORD = "test-only-tsa-key-password"  # public-test-fixture
 _TEST_TSA_CA_KEY_PASSWORD = "test-only-tsa-ca-password"  # public-test-fixture
+
+
+def _stop_registered_server(port: int) -> None:
+    """Shut down a server that ``ensure_tsa_server_running`` registered."""
+    from desktop.signature import tsa_server
+
+    with tsa_server._SERVER_LOCK:
+        running = tsa_server._RUNNING_SERVERS.pop(("127.0.0.1", port), None)
+    if running is not None:
+        server, thread = running
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 # ---------------------------------------------------------------------------
 # Tests: function signatures
@@ -192,13 +206,15 @@ class TestTSAServerIntegration:
         """Start TSA server, request timestamp, verify genTime."""
         key_path, cert_path = tsa_credentials
 
-        port = 13161  # Use non-standard port to avoid conflicts
+        # Port 0: the OS picks a free ephemeral port, so parallel test
+        # processes on this machine can never share (or hijack) a port.
         server, thread = start_tsa_server_background(
             tsa_key_path=key_path,
             tsa_cert_path=cert_path,
             host="127.0.0.1",
-            port=port,
+            port=0,
         )
+        port = server.server_address[1]
 
         try:
             time.sleep(0.3)  # brief wait for server to bind
@@ -223,13 +239,13 @@ class TestTSAServerIntegration:
         """genTime in the TST token should be within a few seconds of now."""
         key_path, cert_path = tsa_credentials
 
-        port = 13162
         server, thread = start_tsa_server_background(
             tsa_key_path=key_path,
             tsa_cert_path=cert_path,
             host="127.0.0.1",
-            port=port,
+            port=0,
         )
+        port = server.server_address[1]
 
         try:
             time.sleep(0.3)
@@ -255,13 +271,13 @@ class TestTSAServerIntegration:
         import requests
 
         key_path, cert_path = tsa_credentials
-        port = 13165
         server, thread = start_tsa_server_background(
             tsa_key_path=key_path,
             tsa_cert_path=cert_path,
             host="127.0.0.1",
-            port=port,
+            port=0,
         )
+        port = server.server_address[1]
 
         try:
             time.sleep(0.3)
@@ -305,16 +321,42 @@ class TestTSAServerIntegration:
         tsa_url, cert_path = ensure_tsa_server_running(
             tsa_dir=tmp_path / "tsa-auto",
             host="127.0.0.1",
-            port=13163,
+            port=0,
         )
 
-        assert tsa_url == "http://127.0.0.1:13163/tsa"
-        assert cert_path.is_file()
+        try:
+            # Port 0 binds an ephemeral port; the URL names the bound one.
+            match = re.fullmatch(r"http://127\.0\.0\.1:(\d+)/tsa", tsa_url)
+            assert match is not None, tsa_url
+            assert int(match.group(1)) != 0
+            assert cert_path.is_file()
 
-        data_hash = hashlib.sha256(b"bootstrap").digest()
-        tst_token = request_timestamp(data_hash, tsa_url)
-        gen_time = verify_timestamp(tst_token, str(cert_path))
-        assert gen_time.tzinfo is not None
+            data_hash = hashlib.sha256(b"bootstrap").digest()
+            tst_token = request_timestamp(data_hash, tsa_url)
+            gen_time = verify_timestamp(tst_token, str(cert_path))
+            assert gen_time.tzinfo is not None
+        finally:
+            _stop_registered_server(int(match.group(1)) if match else 0)
+
+    def test_ensure_tsa_server_running_port_zero_starts_a_fresh_server(
+        self, tmp_path
+    ):
+        # Port 0 is "any free port": a second call never reuses a server
+        # started for another credential directory.
+        first_url, first_cert = ensure_tsa_server_running(
+            tsa_dir=tmp_path / "tsa-first", host="127.0.0.1", port=0,
+        )
+        second_url, second_cert = ensure_tsa_server_running(
+            tsa_dir=tmp_path / "tsa-second", host="127.0.0.1", port=0,
+        )
+        try:
+            assert first_url != second_url
+            data_hash = hashlib.sha256(b"second").digest()
+            token = request_timestamp(data_hash, second_url)
+            assert verify_timestamp(token, str(second_cert)).tzinfo is not None
+        finally:
+            for url in (first_url, second_url):
+                _stop_registered_server(int(url.rsplit(":", 1)[1].split("/")[0]))
 
     def test_missing_passwords_fail_before_creating_credentials(
         self,
@@ -344,7 +386,7 @@ class TestTSAServerIntegration:
             ensure_tsa_server_running(
                 tsa_dir=tmp_path / "empty-password",
                 host="127.0.0.1",
-                port=13166,
+                port=0,
             )
 
     def test_explicit_password_overrides_environment(
@@ -414,3 +456,214 @@ class TestTSAErrors:
     def test_invalid_tst_token_raises(self) -> None:
         with pytest.raises(TSAError):
             verify_timestamp(b"not-a-token", "dummy.pem")
+
+
+# ---------------------------------------------------------------------------
+# Tests: token profile of the local TSA (stage E, E2b)
+# ---------------------------------------------------------------------------
+
+
+def _parse_token(token: bytes):
+    """(SignedData, TSTInfo DER, TSTInfo, signed attributes by type name)."""
+    from asn1crypto import cms, tsp
+
+    signed_data = cms.ContentInfo.load(token)["content"]
+    tst_der = signed_data["encap_content_info"]["content"].parsed.dump()
+    signer = signed_data["signer_infos"][0]
+    attrs = {attr["type"].native: attr["values"] for attr in signer["signed_attrs"]}
+    return signed_data, tst_der, tsp.TSTInfo.load(tst_der), attrs
+
+
+def _cert_asn1(path):
+    from asn1crypto import x509 as asn1_x509
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    cert = x509.load_pem_x509_certificate(path.read_bytes())
+    return asn1_x509.Certificate.load(
+        cert.public_bytes(serialization.Encoding.DER)
+    )
+
+
+class TestTokenProfileOutput:
+    """The local TSA signs ESS attributes, its policy OID and its accuracy."""
+
+    def test_token_carries_ess_signed_attributes(
+        self, release_pki, release_tsa
+    ) -> None:
+        from pyhanko.sign.general import as_signing_certificate_v2
+
+        token = request_timestamp(hashlib.sha256(b"ess").digest(), release_tsa)
+        _signed, tst_der, _info, attrs = _parse_token(token)
+        tsa_cert = _cert_asn1(release_pki.tsa_cert_path)
+
+        assert set(attrs) == {
+            "content_type", "message_digest", "signing_certificate_v2",
+        }
+        assert [v.native for v in attrs["content_type"]] == ["tst_info"]
+        assert [v.native for v in attrs["message_digest"]] == [
+            hashlib.sha256(tst_der).digest()
+        ]
+        (ess,) = attrs["signing_certificate_v2"]
+        first = ess["certs"][0]
+        assert first["hash_algorithm"]["algorithm"].native == "sha256"
+        assert first["cert_hash"].native == hashlib.sha256(
+            tsa_cert.dump()
+        ).digest()
+        serial = first["issuer_serial"]
+        assert serial["serial_number"].native == tsa_cert.serial_number
+        assert serial["issuer"][0].chosen == tsa_cert.issuer
+        # An independent encoder (pyHanko) builds the same attribute value.
+        assert ess.dump() == as_signing_certificate_v2(tsa_cert).dump()
+        # The signature now covers the signed attributes; the existing
+        # verifier handles that form.
+        assert verify_timestamp(token, str(release_pki.tsa_cert_path)).tzinfo
+
+    def test_default_policy_oid_and_accuracy(self, release_tsa) -> None:
+        from desktop.signature.tsa_server import DEFAULT_TSA_POLICY_OID
+
+        token = request_timestamp(hashlib.sha256(b"dflt").digest(), release_tsa)
+        info = _parse_token(token)[2]
+
+        assert DEFAULT_TSA_POLICY_OID == "1.2.3.4.5.6.7.8.9"
+        assert info["policy"].dotted == DEFAULT_TSA_POLICY_OID
+        assert dict(info["accuracy"].native) == {
+            "seconds": 1, "millis": None, "micros": None,
+        }
+
+    @pytest.mark.parametrize(
+        "accuracy, expected",
+        [
+            ({"milliseconds": 250},
+             {"seconds": None, "millis": 250, "micros": None}),
+            ({"seconds": 2, "microseconds": 5},
+             {"seconds": 2, "millis": None, "micros": 5}),
+            ({}, {"seconds": 0, "millis": None, "micros": None}),
+        ],
+    )
+    def test_configured_policy_oid_and_accuracy(
+        self, release_pki, accuracy: dict, expected: dict
+    ) -> None:
+        from datetime import timedelta
+
+        from tests.fixtures.release_pki import running_tsa
+
+        with running_tsa(
+            release_pki.tsa_key_path, release_pki.tsa_cert_path,
+            policy_oid="1.2.3.4.5.6.7.8.10", accuracy=timedelta(**accuracy),
+        ) as url:
+            token = request_timestamp(hashlib.sha256(b"cfg").digest(), url)
+        info = _parse_token(token)[2]
+
+        assert info["policy"].dotted == "1.2.3.4.5.6.7.8.10"
+        assert dict(info["accuracy"].native) == expected
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"policy_oid": "1.2.x"},
+            {"policy_oid": "3.1"},
+            {"policy_oid": ""},
+            {"accuracy": "1s"},
+        ],
+    )
+    def test_invalid_server_options_are_refused(
+        self, release_pki, options: dict
+    ) -> None:
+        from tests.fixtures.release_pki import TSA_KEY_PASSWORD
+
+        with pytest.raises(TSAError):
+            create_tsa_server(
+                release_pki.tsa_key_path, release_pki.tsa_cert_path,
+                key_password=TSA_KEY_PASSWORD, host="127.0.0.1", port=0,
+                **options,
+            )
+
+    def test_negative_accuracy_is_refused(self, release_pki) -> None:
+        from datetime import timedelta
+
+        from tests.fixtures.release_pki import TSA_KEY_PASSWORD
+
+        with pytest.raises(TSAError, match="accuracy"):
+            create_tsa_server(
+                release_pki.tsa_key_path, release_pki.tsa_cert_path,
+                key_password=TSA_KEY_PASSWORD, host="127.0.0.1", port=0,
+                accuracy=timedelta(seconds=-1),
+            )
+
+    def test_clock_seam_pins_gen_time(self, release_tsa, monkeypatch) -> None:
+        from desktop.signature import tsa_server
+
+        pinned = datetime(2026, 9, 28, 10, 0, 0, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(tsa_server, "_utc_now", lambda: pinned)
+
+        token = request_timestamp(hashlib.sha256(b"clk").digest(), release_tsa)
+
+        assert _parse_token(token)[2]["gen_time"].native == pinned
+
+    def test_pyhanko_validates_the_token_against_the_ca(
+        self, release_pki, release_tsa
+    ) -> None:
+        import asyncio
+
+        from pyhanko.sign.validation.generic_cms import validate_tst_signed_data
+        from pyhanko_certvalidator import ValidationContext
+
+        digest = hashlib.sha256(b"pyhanko").digest()
+        token = request_timestamp(digest, release_tsa)
+        signed_data = _parse_token(token)[0]
+        context = ValidationContext(
+            trust_roots=[_cert_asn1(release_pki.ca_cert_path)]
+        )
+
+        status = asyncio.run(
+            validate_tst_signed_data(signed_data, context, lambda _alg: digest)
+        )
+
+        assert status["intact"] is True
+        assert status["valid"] is True
+        assert status["trust_problem_indic"] is None
+
+    def test_pades_timestamp_from_the_local_tsa_validates(
+        self, release_pki, release_tsa, tmp_path
+    ) -> None:
+        import io
+
+        from pyhanko.pdf_utils import generic
+        from pyhanko.pdf_utils.reader import PdfFileReader
+        from pyhanko.pdf_utils.writer import PdfFileWriter
+        from pyhanko.sign.validation import validate_pdf_signature
+        from pyhanko_certvalidator import ValidationContext
+
+        from desktop.signature.pdf_signer import sign_pdf
+        from tests.fixtures.release_pki import POLICY_KEY_PASSWORD
+
+        writer = PdfFileWriter()
+        writer.insert_page(generic.DictionaryObject({
+            generic.NameObject("/Type"): generic.NameObject("/Page"),
+            generic.NameObject("/MediaBox"): generic.ArrayObject(
+                [generic.NumberObject(v) for v in (0, 0, 200, 200)]
+            ),
+        }))
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        pdf_in, pdf_out = tmp_path / "blank.pdf", tmp_path / "signed.pdf"
+        pdf_in.write_bytes(buffer.getvalue())
+
+        warning = sign_pdf(
+            pdf_in, release_pki.policy_cert_path, release_pki.policy_key_path,
+            POLICY_KEY_PASSWORD, pdf_out, tsa_url=release_tsa,
+        )
+
+        assert warning == ""
+        ca = _cert_asn1(release_pki.ca_cert_path)
+        with open(pdf_out, "rb") as handle:
+            embedded = PdfFileReader(handle).embedded_signatures[0]
+            status = validate_pdf_signature(
+                embedded,
+                signer_validation_context=ValidationContext(trust_roots=[ca]),
+                ts_validation_context=ValidationContext(trust_roots=[ca]),
+            )
+        stamp = status.timestamp_validity
+        assert stamp is not None
+        assert (stamp.intact, stamp.valid, stamp.trusted) == (True, True, True)

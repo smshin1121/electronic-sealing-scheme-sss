@@ -22,6 +22,9 @@ from .record_builder import (
     build_seal_record,
     build_unseal_record,
     create_seal_id,
+    is_safe_seal_id,
+    is_valid_seal_id,
+    seal_mode_of,
     validate_record,
 )
 from .unknown_classifier import identify_unknown_files
@@ -29,6 +32,9 @@ from .unknown_classifier import identify_unknown_files
 __all__ = [
     # Record building
     "create_seal_id",
+    "is_safe_seal_id",
+    "is_valid_seal_id",
+    "seal_mode_of",
     "build_seal_record",
     "build_unseal_record",
     "build_reseal_record",

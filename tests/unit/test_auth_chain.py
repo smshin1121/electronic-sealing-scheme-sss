@@ -1,8 +1,11 @@
 """Authentication chain unit tests.
 
 Covers:
-  - BasicAuthenticator: name + birth + phone match/mismatch
-  - PasswordAuthenticator: SHA-256 password verification
+  - BasicAuthenticator: name + birth + phone match/mismatch, compared as
+    keyed digests since stage E (E3a); the case dicts below carry the
+    stored digests, computed with the session's synthetic pepper
+  - PasswordAuthenticator: scrypt hashes, and v1.0.1 SHA-256 hashes
+    (still verified, in constant time)
   - OTPAuthenticator: generate -> verify -> expiry
   - AuthChain: chain combinations (basic only, basic+password, basic+otp)
   - Auth failure lockout: 5 failures -> block
@@ -12,9 +15,11 @@ from __future__ import annotations
 
 import hashlib
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
+from flask import Flask, current_app
 
 from web.auth.auth_chain import (
     AuthChain,
@@ -31,6 +36,16 @@ from web.auth.otp_service import OTPService
 # Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def privacy_context(privacy_key_files):
+    """An app context holding the identity-protection keys (stage E, E3a)."""
+    app = Flask("auth-chain-test")
+    app.config.update(IDENTITY_PEPPER_PATH=privacy_key_files[0],
+                      PRIVACY_KMS_MASTER_KEY_PATH=privacy_key_files[1])
+    with app.app_context():
+        yield app
+
+
 def _make_case(
     *,
     suspect_name: str = "홍길동",
@@ -39,12 +54,21 @@ def _make_case(
     password_hash: str = "",
     auth_level: str = "basic",
 ) -> dict[str, Any]:
-    """Build a minimal case dict matching DB column names."""
+    """Build a case dict as the routes pass it: the stored digests (E3a).
+
+    Needs the ``privacy_context`` app context (its pepper digests the
+    registered values, as registration does).
+    """
+    from web.privacy.digests import identity_digest
+
+    pepper = Path(current_app.config["IDENTITY_PEPPER_PATH"]).read_bytes()
+    seal_id = "S-TEST-001"
     return {
-        "seal_id": "S-TEST-001",
-        "suspect_name": suspect_name,
-        "suspect_birth": suspect_birth,
-        "suspect_phone": suspect_phone,
+        "seal_id": seal_id,
+        "suspect_name_digest": identity_digest(pepper, "name", seal_id, suspect_name),
+        "suspect_birth_digest": identity_digest(pepper, "birth_date", seal_id, suspect_birth),
+        "suspect_phone_digest": identity_digest(pepper, "phone", seal_id, suspect_phone),
+        "identity_scheme": "v1",
         "password_hash": password_hash,
         "auth_level": auth_level,
     }
@@ -57,7 +81,8 @@ def _make_case(
 class TestBasicAuthenticator:
     """BasicAuthenticator: name + birth + phone."""
 
-    def setup_method(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _setup(self, privacy_context) -> None:
         self.auth = BasicAuthenticator()
         self.case = _make_case()
 
@@ -175,15 +200,28 @@ class TestNormalizeBirthDate:
 # ===================================================================
 
 class TestPasswordAuthenticator:
-    """PasswordAuthenticator: SHA-256 comparison."""
+    """PasswordAuthenticator: v1.0.1 SHA-256 hashes (legacy) and scrypt."""
 
-    def setup_method(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _setup(self, privacy_context) -> None:
         self.auth = PasswordAuthenticator()
         self.raw_pw = "SecretPass123!"  # public-test-fixture
         self.pw_hash = hashlib.sha256(
             self.raw_pw.encode("utf-8")
         ).hexdigest()
         self.case = _make_case(password_hash=self.pw_hash)
+
+    def test_scrypt_hash_verifies(self) -> None:
+        from web.auth.case_passwords import hash_case_password
+
+        case = _make_case(password_hash=hash_case_password(self.raw_pw))
+        assert self.auth.authenticate(case, {"password": self.raw_pw}).success is True
+        assert self.auth.authenticate(case, {"password": self.raw_pw + "x"}).success is False
+
+    def test_empty_or_unknown_stored_hash_refuses(self) -> None:
+        for stored in ("", "md5$abc", self.pw_hash.upper()):
+            case = _make_case(password_hash=stored)
+            assert self.auth.authenticate(case, {"password": self.raw_pw}).success is False
 
     def test_correct_password(self) -> None:
         creds = {"password": self.raw_pw}
@@ -215,7 +253,8 @@ class TestPasswordAuthenticator:
 class TestOTPAuthenticator:
     """OTPAuthenticator: generate -> store -> verify -> expiry."""
 
-    def setup_method(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _setup(self, privacy_context) -> None:
         OTPService.configure(
             otp_length=6,
             expiry_seconds=300,

@@ -10,7 +10,17 @@ class CertificateError(SignatureError):
 
 
 class TSAError(SignatureError):
-    """Raised when TSA operations (request, verify, server) fail."""
+    """Raised when TSA operations (request, verify, server) fail.
+
+    ``code`` is a stable failure code (for example ``tsa_chain``) set by
+    the checks of the pinned TSA trust profile
+    (:mod:`desktop.signature.tsa_profile`); it is empty where no code
+    applies. The message itself is free text.
+    """
+
+    def __init__(self, message: str = "", *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class PDFSigningError(SignatureError):

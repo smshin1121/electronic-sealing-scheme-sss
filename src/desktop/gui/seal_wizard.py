@@ -1,24 +1,49 @@
 """Seal process wizard (S1 through S7).
 
 Guides the investigator through the complete sealing workflow:
-S1 - File selection and encryption settings
-S2 - Seizure / sealing information
+S1 - File selection and encryption settings (encrypts via SealProcess.run_s1)
+S2 - Seizure / sealing information, seal mode and unlock days
 S3 - Subject (suspect) information
 S4 - Seal record preview and review
-S5 - Digital signature progress
-S6 - Key splitting results and unlock_time setting
+S5 - Sealing: S4-S7 of SealProcess on a worker thread (record + policy,
+     PAdES signature + TSA timestamp, key split by mode, save)
+S6 - Key splitting results (unlock time read from the signed record)
 S7 - Completion summary
+
+Every seal goes through :class:`desktop.seal_process.SealProcess`; a step
+that fails is shown and blocks the wizard, and no record is produced
+without its signature and timestamp. The seal mode and the unlock days are
+chosen at S2 because S4 writes them into the record before S5 signs it.
 """
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import json
 import logging
+import threading
 import tkinter as tk
-from datetime import datetime, timedelta, timezone
-from tkinter import messagebox
+from datetime import datetime, timezone
+from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from desktop.record import is_valid_seal_id
+from desktop.seal_process import SealProcess, SealResult, seal_output_path
+
 from .i18n import t
+from .seal_mode_view import (
+    MODE_STANDARD,
+    MODE_STRICT,
+    fingerprint_of,
+    key_shares_summary,
+    keysplit_title,
+    recovery_shares_text,
+    seal_mode_rows,
+)
+from .seal_policy_panel import SealPolicyPanel
+from .seal_runner import start_background_seal
+from .share_handout import ShareHandoutPanel, share_file_rows
 from .step_indicator import StepIndicator
 from .theme import FONTS, get_color, get_font
 from .signature_pad import EnhancedSignaturePad
@@ -47,11 +72,40 @@ DEFAULT_CHUNK_GB = 1
 MIN_UNLOCK_DAYS = 1
 MAX_UNLOCK_DAYS = 30
 DEFAULT_UNLOCK_DAYS = 10
+# Wizard data handed to run_seal_steps (no key material, no process object).
+_SEAL_REQUEST_KEYS = (
+    "source_file", "output_dir", "chunk_size_gb", "case_number",
+    "investigator", "seizure", "media", "subject", "signature_lines",
+    "seal_mode", "unlock_days", "seal_id",
+)
+# Input widgets disabled when a past step is reviewed after sealing.
+_INPUT_WIDGETS = (tk.Entry, tk.Spinbox, tk.Button, tk.Checkbutton, tk.Radiobutton,
+                  ttk.Entry, ttk.Button, ttk.Checkbutton, ttk.Radiobutton)
+# Accepted seizure date/time inputs (UTC, as prefilled by S2).
+_SEIZURE_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ")
+# The saved seal kept by the wizard carries no share text.
+_NO_SHARES = ("", "", "", "")
 
 
 def _clean_multiline(text: str) -> str:
     """Strip per-line indentation from an i18n multiline message."""
     return "\n".join(line.strip() for line in text.splitlines()).strip()
+
+
+def seizure_time_iso(text: str) -> Optional[str]:
+    """Parse the S2 seizure date/time (UTC) into the record's ISO 8601 form.
+
+    Returns ``YYYY-MM-DDThh:mm:ssZ``, or None when the text is not a valid
+    ``YYYY-MM-DD HH:MM[:SS]`` or ISO 8601 UTC value.
+    """
+    value = text.strip()
+    for fmt in _SEIZURE_FORMATS:
+        try:
+            parsed = datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+        return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
 
 
 class SealWizard(tk.Frame):
@@ -71,15 +125,33 @@ class SealWizard(tk.Frame):
         on_complete: Optional[Callable[[dict[str, Any]], None]] = None,
         on_cancel: Optional[Callable[[], None]] = None,
         prefill_data: Optional[dict[str, Any]] = None,
+        process_factory: Optional[Callable[[], SealProcess]] = None,
+        ask_share_path: Optional[Callable[..., Any]] = None,
     ) -> None:
         super().__init__(master)
         self._app = app
         self._on_complete = on_complete
         self._on_cancel = on_cancel
         self._prefill_data = prefill_data
+        # The sealing process (created at S1); injectable for tests.
+        self._process_factory = process_factory or (
+            lambda: SealProcess(db_path=app.db_path)
+        )
+        self._process: Optional[SealProcess] = None
+        # The save dialog of the S6 share handout (None: the Tk dialog).
+        self._ask_share_path = ask_share_path
+        # The saved seal, without share text: shares 1 and 2 live only in
+        # the S6 handout panel until completion; 3 and 4 are wrapped in the DB.
+        self._seal_result: Optional[SealResult] = None
+        self._share_prints: tuple[str, ...] = ()
         self._current_step = 0
+        # While a past step is reviewed read-only: the step to return to.
+        self._review_return: Optional[int] = None
         self._data: dict[str, Any] = {}
         self._busy = False
+        self._seal_running = False
+        # Set on destroy so pending background results are discarded.
+        self._async_cancel = threading.Event()
         # Active ProgressDialog (encryption) — joined before cleanup.
         self._active_dialog: Optional[Any] = None
 
@@ -217,7 +289,12 @@ class SealWizard(tk.Frame):
         """Restore the toplevel key bindings captured at build time."""
         if event.widget is not self:
             return
+        self._async_cancel.set()
         self._cleanup_partial_encryption()
+        # However the wizard is left: drop the shares and the process
+        # (which holds the key and the shares).
+        self._handout_panel.clear()
+        self._process = None
         try:
             top = self._bound_toplevel
             if top.winfo_exists():
@@ -273,6 +350,60 @@ class SealWizard(tk.Frame):
             self._nav_msg_label.configure(text=text, fg=color)
         except tk.TclError:
             pass
+
+    def _sealed(self) -> bool:
+        """True once S4-S7 completed: the seal is saved and final."""
+        return bool(self._data.get("signature_done"))
+
+    def is_busy(self) -> bool:
+        """True while work runs that must not be left: the S1 encryption
+        dialog (the window's X reaches the main window through its grab)
+        and S4-S7 in the background."""
+        return self._busy
+
+    def has_unsaved_shares(self) -> bool:
+        """The seal is saved but shares 1/2 are not yet in files (S6)."""
+        return self._sealed() and self._handout_panel.has_unsaved()
+
+    def leave_question(self) -> Optional[tuple[str, str]]:
+        """What leaving now must ask first, as (title, message) i18n keys.
+
+        Only unsaved shares at S6 (``nav.unsaved_*``): S7 stored the seal
+        before the handout, and Cancel and Escape are off once it is saved.
+        """
+        if self.has_unsaved_shares():
+            return ("nav.unsaved_title", "nav.unsaved_msg")
+        return None
+
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        """Toggle background work: navigation and Cancel disabled + status.
+
+        Cancel stays disabled once the seal is saved — the only way on is
+        to complete, so the completion handler records the case metadata.
+        """
+        self._busy = busy
+        try:
+            self._next_btn.configure(state="disabled" if busy else "normal")
+            self._cancel_btn.configure(
+                state="disabled" if busy or self._sealed() else "normal"
+            )
+            if busy:
+                self._prev_btn.configure(state="disabled")
+                self._set_nav_message(message, kind="info")
+                return
+            self._set_nav_message("")
+            if self._current_step > 0 and not (
+                self._current_step >= 4 and self._sealed()
+            ):
+                self._prev_btn.configure(state="normal")
+        except tk.TclError:
+            pass
+
+    def _ensure_process(self) -> SealProcess:
+        """The wizard's sealing process (one per wizard, so S1 can resume)."""
+        if self._process is None:
+            self._process = self._process_factory()
+        return self._process
 
     # ------------------------------------------------------------------
     # Step builders
@@ -374,6 +505,20 @@ class SealWizard(tk.Frame):
         self._validators.append(self._validate_s1)
 
     def _validate_s1(self) -> bool:
+        # A case registered with a legacy ID can never pass S4's record
+        # schema; refuse it here, before the (possibly long) encryption.
+        case_seal_id = self._data.get("seal_id")
+        if case_seal_id and not is_valid_seal_id(case_seal_id):
+            self._set_nav_message(
+                t("validate.legacy_case_id").format(v=case_seal_id)
+            )
+            return False
+        if self._data.get("encryption_done"):
+            # The container is written; S5 puts the signed record next to
+            # it, so the S1 inputs are fixed (their widgets are disabled).
+            self._set_nav_message("")
+            return True
+
         messages: list[str] = []
         focus_target: Optional[tk.Widget] = None
 
@@ -416,83 +561,48 @@ class SealWizard(tk.Frame):
         self._data["output_dir"] = self._output_selector.get()
         self._data["chunk_size_gb"] = self._chunk_var.get()
 
-        # 이미 암호화 완료된 경우 스킵
-        if self._data.get("encryption_done"):
-            return True
-
         # S1 검증 통과 → 바로 암호화 수행 (ProgressDialog)
         self._run_encryption()
         return self._data.get("encryption_done", False)
 
     def _run_encryption(self) -> None:
-        """S1 파일 암호화를 ProgressDialog로 수행 (1패스: 해시는 암호화 중 인라인 계산)."""
-        import os
-        from pathlib import Path
+        """S1: encrypt through SealProcess.run_s1 in a progress dialog.
+
+        MD5/SHA-256 are computed inline during the single encryption pass.
+        The process keeps the AES key: a retry after a cancel or an error
+        reuses it, so ``.enc.progress`` resume never mixes keys. The key
+        never enters the wizard data.
+        """
         from .progress_dialog import ProgressDialog
 
+        process = self._ensure_process()
         source = self._data["source_file"]
         output_dir = self._data["output_dir"]
         chunk_gb = self._data["chunk_size_gb"]
-        # GCM 안전 마진 때문에 crypto의 MAX_CHUNK_SIZE는 64GiB-16MiB로
-        # UI 최대값(64GB)보다 작다 — seal_process와 동일하게 클램프.
-        from desktop.crypto import MAX_CHUNK_SIZE
-        chunk_bytes = min(chunk_gb * 1024 ** 3, MAX_CHUNK_SIZE)
+        # Recorded first, so a wizard destroyed before encryption completes
+        # can remove the partial output.
+        self._data["enc_path_pending"] = seal_output_path(source, output_dir)
 
-        # AES 키: 같은 세션 재시도(취소/오류 후 '다음' 재클릭) 시 반드시
-        # 기존 키를 재사용한다. 새 키를 만들면 .enc.progress 기반 resume이
-        # 이전 키로 암호화된 청크에 새 키 청크를 이어붙여 영구 복호화
-        # 불가가 되기 때문 (crypto 계층의 키 지문 가드와 2중 방어).
-        aes_key = self._data.get("aes_key")
-        if aes_key is None:
-            aes_key = os.urandom(32)
-            self._data["aes_key"] = aes_key
-            self._data["aes_key_hex"] = aes_key.hex()
+        def task_fn(progress_cb):  # type: ignore[no-untyped-def]
+            result = process.run_s1(source, output_dir, chunk_gb,
+                                    progress_cb=progress_cb)
+            return {k: v for k, v in result.items() if k != "aes_key_hex"}
 
-        enc_filename = Path(source).name + ".enc"
-        enc_path = str(Path(output_dir) / enc_filename)
-        # 취소/중단 후 위자드가 완료 없이 destroy될 때 부분 산출물을
-        # 정리할 수 있도록 경로를 먼저 기록한다.
-        self._data["enc_path_pending"] = enc_path
-
-        def task_fn(progress_cb):
-            from desktop.crypto import encrypt_file
-
-            # 메타데이터(MD5/SHA-256)는 encrypt_file 내부에서 암호화
-            # 읽기와 동시에 1패스로 계산된다 (별도 사전 스캔 없음).
-            result = encrypt_file(
-                filepath=source,
-                aes_key=aes_key,
-                output_path=enc_path,
-                chunk_size=chunk_bytes,
-                progress_cb=progress_cb,
-            )
-            return result
-
-        def on_complete(result):
-            import struct, json
-            self._data["enc_path"] = enc_path
-            self._data["enc_result"] = result
-            # 1패스 인라인 해시 결과를 S4 미리보기/기록지에 사용
-            self._data["file_metadata"] = result.metadata
-
-            # .enc 파일에서 메타데이터 읽기
-            try:
-                with open(enc_path, "rb") as f:
-                    f.seek(-4, 2)
-                    meta_size = struct.unpack("<I", f.read(4))[0]
-                    f.seek(-4 - meta_size, 2)
-                    enc_meta = json.loads(f.read(meta_size).decode("utf-8"))
-                self._data["enc_meta"] = enc_meta
-            except Exception:
-                pass
-
+        def on_complete(result):  # type: ignore[no-untyped-def]
+            self._data["enc_path"] = result["enc_filepath"]
+            # Inline single-pass hashes for the S4 preview and S7 summary.
+            self._data["file_metadata"] = dict(result["metadata"])
+            self._data["enc_meta"] = dict(result.get("enc_metadata") or {})
             self._data["encryption_done"] = True
+            self._disable_inputs(self._steps[0])
+
+        notice: list[str] = []
 
         def on_error(exc):
             # 사용자 취소는 오류가 아니다 — 조용한 상태 메시지만 표시.
             # (.enc/.enc.progress는 같은 세션 재시도 resume을 위해 유지)
             if dlg.was_cancelled:
-                self._set_nav_message(t("progress.task_cancelled"), kind="info")
+                notice.append(t("progress.task_cancelled"))  # shown after busy
                 return
             messagebox.showerror(
                 t("encrypt.failed_title"),
@@ -500,18 +610,23 @@ class SealWizard(tk.Frame):
                 parent=self.winfo_toplevel(),
             )
 
-        dlg = ProgressDialog(
-            self.winfo_toplevel(),
-            title=t("process.encryption_progress_title"),
-            task_fn=task_fn,
-            on_complete=on_complete,
-            on_error=on_error,
-        )
-        self._active_dialog = dlg
+        # Busy while the dialog runs: its grab does not stop the window's X.
+        self._set_busy(True, t("process.encryption_progress_title"))
         try:
+            dlg = ProgressDialog(
+                self.winfo_toplevel(),
+                title=t("process.encryption_progress_title"),
+                task_fn=task_fn,
+                on_complete=on_complete,
+                on_error=on_error,
+            )
+            self._active_dialog = dlg
             self.winfo_toplevel().wait_window(dlg)
         finally:
             self._active_dialog = None
+            self._set_busy(False)
+        if notice:
+            self._set_nav_message(notice[0], kind="info")
 
         # 시간 정보 저장
         self._data["encrypt_start_time"] = dlg.start_time_iso
@@ -521,36 +636,37 @@ class SealWizard(tk.Frame):
     # --- S2: Seizure / sealing info ---------------------------------------
 
     def _build_s2(self, parent: tk.Frame) -> None:
-        from tkinter import ttk
-
         tk.Label(
             parent,
             text=t("seal.s2_title"),
             font=get_font("header"),
         ).pack(anchor="w", pady=(0, 12))
 
-        # --- Case info group ---
+        # --- Case info group (every field is required by the record schema)
         case_group = ttk.LabelFrame(parent, text=t("seal.case_info"), padding=(8, 4))
         case_group.pack(fill="x", pady=(0, 8))
 
-        self._case_number = LabeledEntry(case_group, t("seal.case_number"), required=True)
-        self._case_number.pack(fill="x", pady=4)
+        def _entry(key: str) -> LabeledEntry:
+            entry = LabeledEntry(case_group, t(key), required=True)
+            entry.pack(fill="x", pady=3)
+            return entry
 
-        self._seizure_date = LabeledEntry(case_group, t("seal.seizure_date"), required=True)
+        self._case_number = _entry("seal.case_number")
+        self._seizure_date = _entry("seal.seizure_date")
         self._seizure_date.set(datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
-        self._seizure_date.pack(fill="x", pady=4)
+        self._seizure_location = _entry("seal.seizure_location")
+        self._device_user = _entry("seal.device_user")
+        self._storage_type = _entry("seal.storage_type")
+        self._media_manufacturer = _entry("seal.media_manufacturer")
+        self._media_model = _entry("seal.media_model")
+        self._media_serial = _entry("seal.media_serial")
 
-        self._seizure_location = LabeledEntry(case_group, t("seal.seizure_location"), required=True)
-        self._seizure_location.pack(fill="x", pady=4)
-
-        self._media_manufacturer = LabeledEntry(case_group, t("seal.media_manufacturer"))
-        self._media_manufacturer.pack(fill="x", pady=2)
-
-        self._media_model = LabeledEntry(case_group, t("seal.media_model"))
-        self._media_model.pack(fill="x", pady=2)
-
-        self._media_serial = LabeledEntry(case_group, t("seal.media_serial"))
-        self._media_serial.pack(fill="x", pady=2)
+        # --- Seal mode and unlock days (written into the record at S4)
+        self._policy_panel = SealPolicyPanel(
+            parent, min_days=MIN_UNLOCK_DAYS, max_days=MAX_UNLOCK_DAYS,
+            default_days=DEFAULT_UNLOCK_DAYS,
+        )
+        self._policy_panel.pack(fill="x", pady=(0, 8))
 
         # --- Investigator info group ---
         inv_group = ttk.LabelFrame(parent, text=t("seal.investigator_info"), padding=(8, 4))
@@ -564,43 +680,79 @@ class SealWizard(tk.Frame):
 
         self._validators.append(self._validate_s2)
 
-    def _validate_s2(self) -> bool:
-        fields = [
-            self._case_number,
-            self._seizure_date,
-            self._seizure_location,
-            self._investigator_name,
+    def _s2_entries(self) -> list[LabeledEntry]:
+        return [
+            self._case_number, self._seizure_date, self._seizure_location,
+            self._device_user, self._storage_type, self._media_manufacturer,
+            self._media_model, self._media_serial, self._investigator_name,
         ]
+
+    def _validate_s2(self) -> bool:
         invalid: list[LabeledEntry] = []
-        for f in fields:
-            if not f.is_valid():
-                f.highlight_error()
-                invalid.append(f)
+        for entry in self._s2_entries():
+            if entry.is_valid():
+                entry.clear_error()
             else:
-                f.clear_error()
-        if invalid:
+                entry.highlight_error()
+                invalid.append(entry)
+        messages: list[str] = []
+        seizure_iso = seizure_time_iso(self._seizure_date.get())
+        if self._seizure_date.is_valid() and seizure_iso is None:
+            self._seizure_date.highlight_error(t("validate.seizure_datetime"))
+            invalid.append(self._seizure_date)
+            messages.append(t("validate.seizure_datetime"))
+        panel_errors = self._policy_panel.validation_errors() or self._strict_policy_errors()
+        messages.extend(panel_errors)
+
+        error_count = len(invalid) + len(panel_errors)
+        if error_count:
+            single = messages[0] if error_count == 1 and messages else None
             self._set_nav_message(
-                t("validate.fix_errors").format(count=len(invalid))
+                single or t("validate.fix_errors").format(count=error_count)
             )
-            invalid[0].focus_field()
+            if invalid:
+                invalid[0].focus_field()
+            else:
+                self._policy_panel.focus_first_error()
             return False
 
         self._set_nav_message("")
+        self._store_s2(seizure_iso or "")
+        return True
+
+    def _strict_policy_errors(self) -> list[str]:
+        """Strict needs a signed policy; refuse it here rather than at S4.
+
+        Asked only when strict is chosen. Without a process yet (S1 not
+        run) S4 still refuses strict without a policy.
+        """
+        if self._policy_panel.mode != MODE_STRICT or self._process is None:
+            return []
+        if self._process.policy_signer_available():
+            return []
+        return [t("validate.strict_needs_policy")]
+
+    def _store_s2(self, seizure_iso: str) -> None:
+        """Keep the S2 inputs in the shape SealConfig expects."""
         self._data["case_number"] = self._case_number.get()
         self._data["investigator"] = {
             "name": self._investigator_name.get(),
             "rank": self._investigator_rank.get(),
         }
         self._data["seizure"] = {
+            "date": seizure_iso,
             "datetime": self._seizure_date.get(),
             "location": self._seizure_location.get(),
+            "device_user": self._device_user.get(),
         }
         self._data["media"] = {
+            "type": self._storage_type.get(),
             "manufacturer": self._media_manufacturer.get(),
             "model": self._media_model.get(),
             "serial": self._media_serial.get(),
         }
-        return True
+        self._data["seal_mode"] = self._policy_panel.mode
+        self._data["unlock_days"] = self._policy_panel.unlock_days()
 
     # --- S3: Subject (suspect) info ---------------------------------------
 
@@ -710,7 +862,10 @@ class SealWizard(tk.Frame):
             "email": self._subject_email.get(),
             "birth": self._subject_birth.get(),
             "phone": self._subject_phone.get(),
+            # Protects the subject's signing key (S5); dropped after sealing.
             "password": self._subject_password.get(),
+            # The subject signs at S3, so the sealing is attended.
+            "participation": t("seal.participation"),
         }
         self._data["signature_lines"] = self._signature_pad.get_lines()
 
@@ -740,141 +895,34 @@ class SealWizard(tk.Frame):
         self._validators.append(self._validate_s4)
 
     def _validate_s4(self) -> bool:
-        """S4 -- 검토 통과 시 seal_id 생성 + record_dict 구성."""
-        if not self._data.get("record_dict"):
-            existing_seal_id = self._data.get("seal_id")
-            self._generate_seal_data()
-            # 케이스에서 시작한 경우 기존 seal_id 복원
-            if existing_seal_id:
-                self._data["seal_id"] = existing_seal_id
-                # record_dict 내부의 seal_id도 동기화
-                record = self._data.get("record_dict")
-                if record:
-                    record["seal_id"] = existing_seal_id
+        """S4 is a review of the inputs; S5 builds and signs the record."""
         return True
-
-    def _generate_seal_data(self) -> None:
-        """S4 통과 시 seal_id와 record_dict를 생성하여 _data에 저장."""
-        from datetime import datetime, timezone
-
-        try:
-            from desktop.record import create_seal_id, build_seal_record
-            seal_id = create_seal_id()
-        except ImportError:
-            import os
-            now = datetime.now(timezone.utc)
-            rand_hex = os.urandom(3).hex().upper()
-            seal_id = f"S-{now.strftime('%Y%m%d')}-{rand_hex}"
-
-        self._data["seal_id"] = seal_id
-
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        subject = self._data.get("subject", {})
-        investigator = self._data.get("investigator", {})
-        seizure = self._data.get("seizure", {})
-        media = self._data.get("media", {})
-
-        record_dict = {
-            "seal_id": seal_id,
-            "case_info": {
-                "case_number": self._data.get("case_number", ""),
-                "investigator": investigator.get("name", ""),
-                "device_user": media.get("device_user", ""),
-                "suspect": subject.get("name", ""),
-                "storage_type": media.get("type", ""),
-                "storage_info": {
-                    "manufacturer": media.get("manufacturer", ""),
-                    "model": media.get("model", ""),
-                    "serial": media.get("serial", ""),
-                },
-                "seizure_time": seizure.get("datetime", now_iso),
-                "seizure_location": seizure.get("location", ""),
-            },
-            "process_info": {
-                "type": "Sealing",
-                "start_time": self._data.get("encrypt_start_time", now_iso),
-                "end_time": self._data.get("encrypt_end_time", now_iso),
-                "file_count": 1,
-                "investigator": investigator.get("name", ""),
-                "reason": "",
-                "participation": t("seal.participation"),
-            },
-            "file_info": self._build_file_info(),
-            "signer_info": {
-                "name": subject.get("name", ""),
-                "email": subject.get("email", ""),
-                "birth_date": subject.get("birth", ""),
-                "phone": subject.get("phone", ""),
-                "cert_fingerprint": "",
-                "signature_image_hash": "",
-            },
-            "history": {
-                "summary": "S1U0R0",
-                "events": [{
-                    "id": 1,
-                    "seal_type": "Sealing",
-                    "start_time": now_iso,
-                    "end_time": "",
-                    "investigator": investigator.get("name", ""),
-                }],
-            },
-        }
-        self._data["record_dict"] = record_dict
-
-    def _build_file_info(self) -> dict:
-        """암호화 결과가 있으면 실제 메타데이터로, 없으면 빈 값으로 file_info 구성."""
-        from pathlib import Path
-
-        meta = self._data.get("file_metadata")
-        enc_meta = self._data.get("enc_meta", {})
-        enc_path = self._data.get("enc_path", "")
-
-        def _nt(t_val: str) -> str:
-            return t_val.replace("+00:00", "Z") if t_val and t_val.endswith("+00:00") else (t_val or "")
-
-        if meta:
-            original_files = [{
-                "filename": meta.filename,
-                "size": meta.size,
-                "md5": meta.md5,
-                "sha256": meta.sha256,
-                "mtime": _nt(meta.mtime),
-                "ctime": _nt(meta.ctime),
-                "atime": _nt(meta.atime),
-            }]
-        else:
-            original_files = [{
-                "filename": self._data.get("source_file", ""),
-                "size": 0, "md5": "", "sha256": "",
-                "mtime": "", "ctime": "", "atime": "",
-            }]
-
-        if enc_meta and enc_path:
-            enc_size = Path(enc_path).stat().st_size if Path(enc_path).exists() else 0
-            result_files = [{
-                "filename": Path(enc_path).name,
-                "size": enc_size,
-                "encryption_algo": "AES-256-GCM",
-                "enc_ended_time": self._data.get("encrypt_end_time", ""),
-                "nonces": enc_meta.get("nonces", []),
-                "tags": enc_meta.get("tags", []),
-                "chunk_lengths": enc_meta.get("chunk_lengths", []),
-            }]
-        else:
-            result_files = []
-
-        return {
-            "original_files": original_files,
-            "result_files": result_files,
-            "hash_match": True,
-            "unknown_files": [],
-            "derived_files": [],
-        }
 
     @staticmethod
     def _section_title(key: str) -> str:
         """Strip bracket decoration from legacy i18n section keys."""
         return t(key).strip("[] ")
+
+    @staticmethod
+    def _file_size_text(meta: Optional[dict[str, Any]]) -> str:
+        if not meta:
+            return ""
+        size = int(meta.get("size", 0))
+        return f"{size:,} bytes ({size / (1024 ** 3):.3f} GB)"
+
+    def _policy_preview_rows(self) -> list[tuple]:
+        """S4 rows for the seal mode and unlock days chosen at S2."""
+        mode = self._data.get("seal_mode", MODE_STANDARD)
+        rows: list[tuple] = seal_mode_rows({"seal_mode": mode})
+        rows.append((
+            t("summary.unlock_days"),
+            t("summary.unlock_days_value").format(v=self._data.get("unlock_days", "")),
+        ))
+        if self._data.get("seal_id"):
+            rows.append((t("summary.case_seal_id"), self._data["seal_id"]))
+        if mode == MODE_STRICT:
+            rows.append(("", t("mode.strict_warning"), "warning"))
+        return rows
 
     def _refresh_s4_preview(self) -> None:
         """Populate the S4 preview cards with collected data."""
@@ -889,11 +937,10 @@ class SealWizard(tk.Frame):
             (t("summary.chunk_size"), f"{self._data.get('chunk_size_gb', '')} GB"),
         ]
         if meta:
-            gb = meta.size / (1024 ** 3)
             file_rows.extend([
-                (t("summary.file_size"), f"{meta.size:,} bytes ({gb:.3f} GB)"),
-                (t("summary.sha256"), meta.sha256),
-                (t("summary.md5"), meta.md5),
+                (t("summary.file_size"), self._file_size_text(meta)),
+                (t("summary.sha256"), meta.get("sha256", "")),
+                (t("summary.md5"), meta.get("md5", "")),
             ])
         enc_path = self._data.get("enc_path")
         if enc_path:
@@ -911,17 +958,23 @@ class SealWizard(tk.Frame):
             {
                 "title": self._section_title("preview.seizure_info"),
                 "rows": [
-                    (t("summary.seizure_datetime"), seizure.get("datetime", "")),
+                    (t("summary.seizure_datetime"), seizure.get("date", "")),
                     (t("summary.seizure_location"), seizure.get("location", "")),
+                    (t("seal.device_user"), seizure.get("device_user", "")),
                 ],
             },
             {
                 "title": self._section_title("preview.media_info"),
                 "rows": [
+                    (t("seal.storage_type"), media.get("type", "")),
                     (t("summary.manufacturer"), media.get("manufacturer", "")),
                     (t("summary.model"), media.get("model", "")),
                     (t("summary.serial"), media.get("serial", "")),
                 ],
+            },
+            {
+                "title": t("mode.section_title"),
+                "rows": self._policy_preview_rows(),
             },
             {
                 "title": self._section_title("preview.subject_info"),
@@ -978,133 +1031,114 @@ class SealWizard(tk.Frame):
         self._validators.append(self._validate_s5)
 
     def _validate_s5(self) -> bool:
-        """S5 proceeds after signature processing is triggered."""
-        return self._data.get("signature_done", False)
+        """S5 passes once the seal is saved; after a failure, Next retries."""
+        if self._sealed():
+            return True
+        if not self._seal_running:
+            self._start_background_seal()
+        return False
 
     def _update_s5_status(self, message: str) -> None:
         """Append a status line to the S5 status text."""
-        self._s5_status.configure(state="normal")
-        self._s5_status.insert("end", f"  {message}\n")
-        self._s5_status.see("end")
-        self._s5_status.configure(state="disabled")
+        try:
+            self._s5_status.configure(state="normal")
+            self._s5_status.insert("end", f"  {message}\n")
+            self._s5_status.see("end")
+            self._s5_status.configure(state="disabled")
+        except tk.TclError:
+            pass
 
     def _trigger_s5_signing(self) -> None:
-        """S5 화면 진입 시 자동으로 전자서명 프로세스를 백그라운드에서 시작."""
-        if self._data.get("signature_done"):
-            return  # 이미 완료됨
+        """Entering S5 starts the seal (S4-S7) unless done or running."""
+        if self._sealed() or self._seal_running:
+            return
+        self._start_background_seal()
 
-        import threading
+    def _seal_request(self) -> dict[str, Any]:
+        """The wizard data run_seal_steps needs (no key, no process).
 
-        # Cache toplevel reference on main thread (tk.call is not thread-safe)
-        _toplevel = self.winfo_toplevel()
+        A deep copy: the worker thread never shares a dict with the wizard.
+        """
+        return copy.deepcopy(
+            {k: self._data[k] for k in _SEAL_REQUEST_KEYS if k in self._data}
+        )
 
-        def _status_cb(msg: str) -> None:
-            try:
-                _toplevel.after(0, self._update_s5_status, msg)
-            except RuntimeError:
-                logger.debug("Cannot schedule status update (window destroyed?)")
+    def _start_background_seal(self) -> None:
+        """Run S4-S7 of SealProcess on a worker thread (S5 screen)."""
+        self._seal_running = True
+        self._set_busy(True, t("seal.s5_running"))
+        self._s5_progress_label.configure(
+            text=t("seal.s5_running"), fg=get_color("text_secondary")
+        )
+        self._update_s5_status(t("seal.sig_process_start"))
+        try:
+            start_background_seal(
+                self, self._ensure_process(), self._seal_request(),
+                on_progress=self._update_s5_status,
+                on_success=self._on_seal_success,
+                on_error=self._on_seal_error,
+                cancel_event=self._async_cancel,
+            )
+        except Exception as exc:  # the worker could not even start
+            self._on_seal_error(exc)
 
-        def _run_signing() -> None:
-            try:
-                _status_cb(t("seal.sig_process_start"))
+    def _on_seal_success(self, result: SealResult) -> None:
+        """Keep the saved seal; from here on it can only be completed.
 
-                seal_process = self._data.get("_seal_process")
-                if seal_process is None:
-                    _status_cb(t("seal.sig_no_process"))
-                    _run_simple_signing()
-                    return
-
-                result = seal_process.run_s5(status_cb=_status_cb)
-                self._data["s5_result"] = result
-                _status_cb(t("seal.sig_process_done"))
-
-            except Exception as exc:
-                _status_cb(t("seal.sig_error_continue").format(v=exc))
-            finally:
-                try:
-                    _toplevel.after(0, self._mark_s5_done)
-                except RuntimeError:
-                    # Window may be destroyed; mark done directly
-                    self._data["signature_done"] = True
-
-        def _run_simple_signing() -> None:
-            """SealProcess 없이 간이 서명 수행 (독립 실행 시)."""
-            import json
-            import hashlib
-            from pathlib import Path
-
-            seal_id = self._data.get("seal_id", "S-00000000-000000")
-            output_dir = Path(self._data.get("output_dir", "."))
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            # JSON 저장
-            record = self._data.get("record_dict", {})
-            json_path = str(output_dir / f"{seal_id}_record.json")
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(record, f, ensure_ascii=False, indent=2)
-            _status_cb(t("seal.record_json_saved"))
-
-            # PDF placeholder
-            pdf_path = str(output_dir / f"{seal_id}_seal_record.pdf")
-            try:
-                from desktop.record import render_record_pdf
-                render_record_pdf(record, "seal_record.html", pdf_path)
-                _status_cb(t("seal.pdf_rendered"))
-            except Exception as exc:
-                _status_cb(t("seal.pdf_fallback").format(v=exc))
-                Path(pdf_path).write_text(f"[Placeholder] {seal_id}")
-
-            # 인증서 생성
-            try:
-                from desktop.signature import (
-                    generate_keypair,
-                    create_self_signed_cert,
-                    save_private_key,
-                    save_certificate,
-                )
-                sig_data = json.dumps(self._data.get("signature_lines", [])).encode()
-                sig_hash = hashlib.sha256(sig_data).hexdigest()
-                subject = self._data.get("subject", {})
-                name = subject.get("name", "Unknown")
-                email = subject.get("email", "unknown@example.com")
-                pw = subject.get("password")
-                if not isinstance(pw, str) or not pw:
-                    raise ValueError(
-                        "Subject password is required for private-key encryption"
-                    )
-
-                private_key, _ = generate_keypair(2048)
-                _status_cb(t("seal.rsa_keygen"))
-
-                cert = create_self_signed_cert(private_key, name, email, sig_hash)
-                _status_cb(t("seal.x509_cert"))
-
-                cert_path = str(output_dir / f"{seal_id}_cert.pem")
-                key_path = str(output_dir / f"{seal_id}_key.pem")
-                save_certificate(cert, cert_path)
-                save_private_key(private_key, key_path, pw)
-                _status_cb(t("seal.cert_saved"))
-
-                self._data["cert_pem_path"] = cert_path
-                self._data["key_pem_path"] = key_path
-            except Exception as exc:
-                _status_cb(t("seal.cert_error").format(v=exc))
-
-            self._data["pdf_path"] = pdf_path
-            self._data["record_json_path"] = json_path
-            _status_cb(t("seal.sig_process_done"))
-
-        thread = threading.Thread(target=_run_signing, daemon=True)
-        thread.start()
-
-    def _mark_s5_done(self) -> None:
-        """S5 완료 마킹 — 다음 버튼 활성화."""
-        self._data["signature_done"] = True
+        Shares 1 and 2 go to the S6 handout panel (saved to files there);
+        the wizard keeps only their fingerprints, and ``_seal_result`` keeps
+        no share text. The process, which still holds the AES key, is
+        released.
+        """
+        record = json.loads(result.record_json)
+        subject = {
+            k: v for k, v in self._data.get("subject", {}).items()
+            if k != "password"
+        }
+        mode = record.get("seal_mode", MODE_STANDARD)
+        self._share_prints = tuple(fingerprint_of(s) for s in result.key_shares)
+        self._handout_panel.load(result.seal_id, result.key_shares[:2], mode)
+        self._seal_result = dataclasses.replace(result, key_shares=_NO_SHARES)
+        self._process = None
+        self._data.update({
+            "seal_id": result.seal_id,
+            "record_json": result.record_json,
+            "record_dict": record,
+            "pdf_path": result.pdf_path,
+            "unlock_time_iso": result.unlock_time_iso,
+            "seal_mode": mode,
+            "subject": subject,
+            "signature_done": True,
+        })
+        self._seal_running = False
+        self._set_busy(False)
+        self._update_s5_status(t("seal.sig_process_done"))
         self._s5_progress_label.configure(
             text=t("seal.s5_complete"), fg=get_color("success_text")
         )
+        logger.info(
+            "봉인 완료: seal_id=%s mode=%s", result.seal_id, self._data["seal_mode"]
+        )
 
-    # --- S6: Key split results + unlock_time ------------------------------
+    def _on_seal_error(self, exc: Exception) -> None:
+        """Show the failing step; the wizard stays on S5 and Next retries."""
+        step = getattr(exc, "step", "S4-S7")
+        cause = getattr(exc, "cause", exc)
+        logger.warning("봉인 실패 (%s): %s", step, cause)
+        self._seal_running = False
+        self._set_busy(False)
+        self._update_s5_status(t("seal.failed_status").format(step=step, v=cause))
+        self._s5_progress_label.configure(
+            text=t("seal.failed_retry"), fg=get_color("danger_text")
+        )
+        messagebox.showerror(
+            t("seal.failed_title"),
+            t("seal.failed_msg").format(step=step, v=cause),
+            parent=self.winfo_toplevel(),
+        )
+        self._set_nav_message(t("seal.failed_retry"))
+
+    # --- S6: Key split results (unlock time from the signed record) --------
 
     def _build_s6(self, parent: tk.Frame) -> None:
         tk.Label(
@@ -1127,99 +1161,55 @@ class SealWizard(tk.Frame):
         )
         self._s6_result.pack(fill="both", expand=True, pady=4)
 
-        unlock_frame = tk.Frame(parent)
-        unlock_frame.pack(fill="x", pady=8)
-        tk.Label(
-            unlock_frame,
-            text=t("seal.unlock_label"),
-            anchor="w",
-            width=20,
-        ).pack(side="left")
-        self._unlock_days_var = tk.IntVar(value=DEFAULT_UNLOCK_DAYS)
-        self._unlock_spin = tk.Spinbox(
-            unlock_frame,
-            from_=MIN_UNLOCK_DAYS,
-            to=MAX_UNLOCK_DAYS,
-            textvariable=self._unlock_days_var,
-            width=6,
+        # Shares 1 and 2 are handed out here, as two separate .share files.
+        self._handout_panel = ShareHandoutPanel(
+            parent, ask_save_path=self._ask_share_path
         )
-        self._unlock_spin.pack(side="left")
-        tk.Label(unlock_frame, text=t("seal.unlock_range")).pack(
-            side="left", padx=8
-        )
+        self._handout_panel.pack(fill="x", pady=(4, 0))
 
         self._validators.append(self._validate_s6)
 
     def _validate_s6(self) -> bool:
-        try:
-            days = self._unlock_days_var.get()
-            if not (MIN_UNLOCK_DAYS <= days <= MAX_UNLOCK_DAYS):
-                raise ValueError
-        except (tk.TclError, ValueError):
-            self._set_nav_message(
-                t("validate.unlock_range").format(
-                    min=MIN_UNLOCK_DAYS, max=MAX_UNLOCK_DAYS
-                )
-            )
-            self._unlock_spin.focus_set()
+        """S6 -> S7 once the seal is saved and shares 1 and 2 are in files."""
+        if self._seal_result is None:
             return False
-
-        self._set_nav_message("")
-        now = datetime.now(tz=timezone.utc)
-        unlock_time = now + timedelta(days=days)
-        self._data["unlock_days"] = days
-        self._data["unlock_time_iso"] = unlock_time.isoformat()
+        if not self._handout_panel.all_saved():
+            self._set_nav_message(t("handout.save_both_first"))
+            return False
         return True
 
+    def _s6_lines(self) -> list[str]:
+        result = self._seal_result
+        if result is None or len(self._share_prints) != 4:
+            return [t("keysplit.failed")]
+        mode = self._data.get("seal_mode", MODE_STANDARD)
+        shares = self._share_prints
+        lines = [
+            keysplit_title(mode),
+            "",
+            t("keysplit.share_subject").format(v=shares[0]),
+            t("keysplit.share_investigator").format(v=shares[1]),
+            t("keysplit.share_system").format(v=shares[2]),
+            t("keysplit.share_admin").format(v=shares[3]),
+            t("keysplit.fingerprint_note"),
+            "",
+            t("keysplit.unlock_signed").format(v=result.unlock_time_iso),
+            t("keysplit.recovery").format(v=recovery_shares_text(mode)),
+            "",
+            t("keysplit.subject_store"),
+            t("keysplit.investigator_store"),
+            t("keysplit.system_store"),
+        ]
+        if mode == MODE_STRICT:
+            lines += ["", t("mode.strict_warning")]
+        return lines
+
     def _refresh_s6_result(self) -> None:
-        """S6 진입 시 키 분할 수행 + 결과 표시."""
+        """Show the key split of the saved seal (read from the SealResult)."""
         self._s6_result.configure(state="normal")
         self._s6_result.delete("1.0", "end")
-
-        # 키 분할이 아직 안 되어 있으면 수행
-        shares = self._data.get("key_shares")
-        if not shares or len(shares) != 4:
-            shares = self._perform_key_split()
-
-        if shares and len(shares) == 4:
-            lines = [
-                t("keysplit.complete_title"),
-                "",
-                t("keysplit.share_subject").format(v=shares[0][:20]),
-                t("keysplit.share_investigator").format(v=shares[1][:20]),
-                t("keysplit.share_system").format(v=shares[2][:20]),
-                t("keysplit.share_admin").format(v=shares[3][:20]),
-                "",
-                t("keysplit.subject_store"),
-                t("keysplit.investigator_store"),
-                t("keysplit.system_store"),
-            ]
-        else:
-            lines = [t("keysplit.failed")]
-
-        self._s6_result.insert("1.0", "\n".join(lines))
+        self._s6_result.insert("1.0", "\n".join(self._s6_lines()))
         self._s6_result.configure(state="disabled")
-
-    def _perform_key_split(self) -> tuple[str, ...] | None:
-        """AES 키를 생성하고 SSS(2-of-4)로 분할한다."""
-        import os
-        try:
-            from desktop.crypto import split_key
-
-            # S1에서 실제 암호화된 키가 있으면 사용, 없으면 새로 생성
-            aes_key_hex = self._data.get("aes_key_hex")
-            if not aes_key_hex:
-                aes_key = os.urandom(32)
-                aes_key_hex = aes_key.hex()
-                self._data["aes_key_hex"] = aes_key_hex
-
-            shares = split_key(aes_key_hex)
-            self._data["key_shares"] = shares
-            return shares
-        except Exception as exc:
-            logging.getLogger(__name__).warning("키 분할 실패: %s", exc)
-            self._s6_result.insert("end", f"\n{t('common.error')}: {exc}")
-            return None
 
     # --- S7: Completion summary -------------------------------------------
 
@@ -1238,8 +1228,26 @@ class SealWizard(tk.Frame):
         self._validators.append(self._validate_s7)
 
     def _validate_s7(self) -> bool:
-        """Final step -- always valid."""
-        return True
+        """Completion needs a saved seal (no path completes without one)."""
+        return self._sealed()
+
+    def _s7_key_rows(self) -> list[tuple]:
+        """Mode, unlock time, shares and policy status of the saved seal."""
+        record = self._data.get("record_dict") or {}
+        mode = self._data.get("seal_mode", MODE_STANDARD)
+        signed = "policy" in record
+        rows: list[tuple] = seal_mode_rows(record)
+        rows.extend([
+            (t("summary.unlock_time"), self._data.get("unlock_time_iso", "N/A")),
+            (t("summary.key_shares"), key_shares_summary(mode)),
+            (
+                t("summary.policy"),
+                t("summary.policy_signed") if signed else t("summary.policy_absent"),
+                "success" if signed else "warning",
+            ),
+        ])
+        rows.extend(share_file_rows(self._handout_panel.saved()))
+        return rows
 
     def _refresh_s7_summary(self) -> None:
         """Populate the final summary cards with time information."""
@@ -1249,12 +1257,7 @@ class SealWizard(tk.Frame):
         enc_start = self._data.get("encrypt_start_time", "N/A")
         enc_end = self._data.get("encrypt_end_time", "N/A")
         enc_elapsed = self._data.get("encrypt_elapsed", 0)
-
-        meta = self._data.get("file_metadata")
-        file_size_str = ""
-        if meta:
-            gb = meta.size / (1024 ** 3)
-            file_size_str = f"{meta.size:,} bytes ({gb:.3f} GB)"
+        file_size_str = self._file_size_text(self._data.get("file_metadata"))
 
         sections = [
             {
@@ -1273,6 +1276,7 @@ class SealWizard(tk.Frame):
                     (t("summary.source_file"), self._data.get("source_file", "")),
                     (t("summary.file_size"), file_size_str),
                     (t("summary.enc_file"), self._data.get("enc_path", "N/A")),
+                    (t("summary.signed_pdf"), self._data.get("pdf_path", "N/A")),
                 ],
             },
             {
@@ -1285,10 +1289,7 @@ class SealWizard(tk.Frame):
             },
             {
                 "title": self._section_title("complete.key_section"),
-                "rows": [
-                    (t("summary.unlock_time"), self._data.get("unlock_time_iso", "N/A")),
-                    (t("summary.key_shares"), "4 (SSS 2-of-4)"),
-                ],
+                "rows": self._s7_key_rows(),
             },
             {
                 "title": t("summary.notice"),
@@ -1319,13 +1320,16 @@ class SealWizard(tk.Frame):
         self._step_label.configure(
             text=t("common.step_of").format(current=step_num, total=self.TOTAL_STEPS)
         )
-        # S5(digital signature) 이후에는 이전 버튼 비활성화
-        if index >= 4 and self._data.get("signature_done"):
+        # Once sealed (S5 done) there is no way back, and nothing to cancel.
+        if index >= 4 and self._sealed():
             self._prev_btn.configure(state="disabled")
         elif index > 0:
             self._prev_btn.configure(state="normal")
         else:
             self._prev_btn.configure(state="disabled")
+        self._cancel_btn.configure(
+            state="disabled" if self._sealed() or self._busy else "normal"
+        )
 
         if index == self.TOTAL_STEPS - 1:
             self._next_btn.configure(text=t("common.complete"))
@@ -1349,37 +1353,49 @@ class SealWizard(tk.Frame):
         """Handle step indicator click to navigate or view past steps."""
         if self._busy:
             return
-        current = self._current_step
-
-        # Cannot navigate to future steps
-        if step_index > current:
+        actual = self._current_step if self._review_return is None else self._review_return
+        if step_index > actual or step_index == self._current_step:
             return
-
-        # Same step — no-op
-        if step_index == current:
-            return
-
-        # After signature, cannot go back — show readonly
-        if self._data.get("signature_done") and step_index < 4:
+        # After sealing, S1-S4 can only be reviewed read-only.
+        if self._sealed() and step_index < 4:
             self._show_step_readonly(step_index)
             return
-
-        # Normal navigation
+        if self._review_return is not None:
+            self._return_to_actual(step_index)
+            return
         self._show_step(step_index)
 
     def _show_step_readonly(self, index: int) -> None:
-        """Show a past step in read-only mode with a 'back to current' button."""
-        actual_step = self._current_step
+        """Show a past step in read-only mode with a "back to current" button.
+
+        The step to return to is kept across nested review visits, and the
+        reviewed step's inputs are disabled: after sealing, S1-S4 values can
+        no longer take effect (the record is signed and saved).
+        """
+        if self._review_return is None:
+            self._review_return = self._current_step
+        actual_step = self._review_return
         self._show_step(index)
-        # Override nav buttons for readonly viewing
+        self._disable_inputs(self._steps[index])
         self._next_btn.configure(
             text=t("common.back_to_current"),
             command=lambda: self._return_to_actual(actual_step),
         )
         self._prev_btn.configure(state="disabled")
 
+    def _disable_inputs(self, widget: tk.Misc) -> None:
+        """Disable every input widget below ``widget``."""
+        for child in widget.winfo_children():
+            if isinstance(child, _INPUT_WIDGETS):
+                try:
+                    child.configure(state="disabled")
+                except tk.TclError:
+                    pass
+            self._disable_inputs(child)
+
     def _return_to_actual(self, actual_step: int) -> None:
         """Return to the actual current step from readonly view."""
+        self._review_return = None
         self._next_btn.configure(
             text=t("common.next"),
             command=self._go_next,
@@ -1398,20 +1414,29 @@ class SealWizard(tk.Frame):
             return
         self._go_next()
 
-    def _on_escape_key(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
-        if self._busy:
+    def _on_escape_key(self, _event: Optional[tk.Event]) -> None:  # type: ignore[type-arg]
+        if self._busy or self._sealed():
             return
         self._handle_cancel()
 
     def _go_next(self) -> None:
         """Advance to the next step after validation."""
+        if self._busy:
+            return
+        if self._review_return is not None:
+            # Reviewing a past step (also reached by the Return key): go back,
+            # never validate the reviewed step.
+            self._return_to_actual(self._review_return)
+            return
         idx = self._current_step
         validator = self._validators[idx]
         if not validator():
             return
 
         if idx == self.TOTAL_STEPS - 1:
-            # Final step -- complete
+            # Final step -- complete. The shares were handed out at S6;
+            # drop them before the application takes over.
+            self._handout_panel.clear()
             if self._on_complete is not None:
                 self._on_complete(self._data)
             return
@@ -1421,11 +1446,15 @@ class SealWizard(tk.Frame):
 
     def _go_prev(self) -> None:
         """Return to the previous step."""
+        if self._busy:
+            return
         if self._current_step > 0:
             self._show_step(self._current_step - 1)
 
     def _handle_cancel(self) -> None:
-        """Confirm cancellation with the user."""
+        """Confirm cancellation; a saved seal is completed, not cancelled."""
+        if self._busy or self._sealed():
+            return
         if messagebox.askyesno(
             t("cancel.title"),
             t("seal.cancel_confirm"),
@@ -1435,7 +1464,7 @@ class SealWizard(tk.Frame):
                 self._on_cancel()
 
     # ------------------------------------------------------------------
-    # Public API for SealProcess to update wizard state
+    # Public API
     # ------------------------------------------------------------------
 
     def set_data(self, key: str, value: Any) -> None:
@@ -1450,14 +1479,3 @@ class SealWizard(tk.Frame):
         """Programmatically show a given step (0-indexed)."""
         if 0 <= step < self.TOTAL_STEPS:
             self._show_step(step)
-
-    def append_s5_status(self, message: str) -> None:
-        """Add a status message to the S5 signature progress view."""
-        self._update_s5_status(message)
-
-    def set_s5_complete(self) -> None:
-        """Mark S5 as done so the user can proceed."""
-        self._data["signature_done"] = True
-        self._s5_progress_label.configure(
-            text=t("seal.s5_complete"), fg=get_color("success_text")
-        )

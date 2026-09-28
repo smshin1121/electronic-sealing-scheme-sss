@@ -45,6 +45,10 @@ class MainApp:
         self.db_path = db_path
         self._current_frame: Optional[tk.Frame] = None
         self._current_view: str = "home"  # track current view for refresh
+        # The seal or reseal wizard on screen, if any: views are not switched
+        # (and the window is not closed) while it seals or reseals in the
+        # background, and not without a question while shares are unsaved.
+        self._active_wizard: Optional[Any] = None
 
         # Non-modal toast notifications (informational feedback)
         self.toasts = ToastManager()
@@ -52,6 +56,8 @@ class MainApp:
         self._build_menu()
         self._build_main_frame()
         self._show_home()
+        # The window's close button (X) is guarded like Exit.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
 
         add_listener(self._on_language_change)
 
@@ -161,9 +167,40 @@ class MainApp:
 
     def _clear_content(self) -> None:
         """Remove the current content frame."""
+        self._active_wizard = None
         if self._current_frame is not None:
             self._current_frame.destroy()
             self._current_frame = None
+
+    def _can_leave_view(self) -> bool:
+        """Whether the current view may be left (menus, Exit, the X button).
+
+        Refused (with a warning) while the seal or reseal wizard is busy
+        (S1/R5 encryption dialog, S4-S7; R6 record, R8 save). Otherwise the
+        wizard's ``leave_question()`` names what leaving would lose, and the
+        operator is asked first (default: stay): shares 1/2 split but not
+        saved to files (a strict seal could then never be opened), or saved
+        while the reseal is not recorded in the database (R8).
+        """
+        wizard = self._active_wizard
+        try:
+            alive = wizard is not None and bool(wizard.winfo_exists())
+        except tk.TclError:
+            alive = False
+        if not alive:
+            return True
+        if wizard.is_busy():
+            messagebox.showwarning(
+                t("nav.busy_title"), t("nav.busy_msg"), parent=self.root
+            )
+            return False
+        question = wizard.leave_question()
+        if question is None:
+            return True
+        title, message = question
+        return bool(messagebox.askyesno(
+            t(title), t(message), icon="warning", default="no", parent=self.root,
+        ))
 
     def _set_content(self, frame: tk.Frame) -> None:
         """Replace the content area with the given frame.
@@ -201,6 +238,8 @@ class MainApp:
         """Switch to the case management screen."""
         from .case_manager import CaseManager
 
+        if not self._can_leave_view():
+            return
         self._current_view = "case_manager"
         # 이전 뷰를 먼저 파괴 — 새 위자드 생성 후 파괴하면 이전
         # 위자드의 <Destroy> 핸들러가 새 바인딩을 덮어쓴다.
@@ -215,6 +254,8 @@ class MainApp:
         """Switch to the seal wizard."""
         from .seal_wizard import SealWizard
 
+        if not self._can_leave_view():
+            return
         self._current_view = "seal"
         # 이전 뷰를 먼저 파괴 — 새 위자드 생성 후 파괴하면 이전
         # 위자드의 <Destroy> 핸들러가 새 바인딩을 덮어쓴다.
@@ -228,12 +269,15 @@ class MainApp:
         )
         wizard.pack(fill="both", expand=True)
         self._set_content(frame)
+        self._active_wizard = wizard
         logger.info("봉인 프로세스 시작")
 
     def _on_unseal(self) -> None:
         """Switch to the unseal wizard."""
         from .unseal_wizard import UnsealWizard
 
+        if not self._can_leave_view():
+            return
         self._current_view = "unseal"
         # 이전 뷰를 먼저 파괴 — 새 위자드 생성 후 파괴하면 이전
         # 위자드의 <Destroy> 핸들러가 새 바인딩을 덮어쓴다.
@@ -253,6 +297,8 @@ class MainApp:
         """Switch to the reseal wizard."""
         from .reseal_wizard import ResealWizard
 
+        if not self._can_leave_view():
+            return
         self._current_view = "reseal"
         # 이전 뷰를 먼저 파괴 — 새 위자드 생성 후 파괴하면 이전
         # 위자드의 <Destroy> 핸들러가 새 바인딩을 덮어쓴다.
@@ -266,6 +312,7 @@ class MainApp:
         )
         wizard.pack(fill="both", expand=True)
         self._set_content(frame)
+        self._active_wizard = wizard
         logger.info("재봉인 프로세스 시작")
 
     def _on_seal_with_case(self, case_data: dict[str, Any]) -> None:
@@ -286,6 +333,7 @@ class MainApp:
         )
         wizard.pack(fill="both", expand=True)
         self._set_content(frame)
+        self._active_wizard = wizard
         logger.info("봉인 프로세스 시작 (케이스 연동): seal_id=%s", case_data.get("seal_id"))
 
     def _on_unseal_with_case(self, case_data: dict[str, Any]) -> None:
@@ -326,6 +374,7 @@ class MainApp:
         )
         wizard.pack(fill="both", expand=True)
         self._set_content(frame)
+        self._active_wizard = wizard
         logger.info("재봉인 프로세스 시작 (케이스 연동): seal_id=%s", case_data.get("seal_id"))
 
     def _ensure_seal_record_exists(self, data: dict[str, Any], seal_id: str) -> None:
@@ -456,9 +505,11 @@ class MainApp:
         else:
             status = default_status
 
-        # Prepare record_json and pdf_path for update
+        # Prepare record_json and pdf_path for update. The seal wizard hands
+        # over the JSON exactly as SealProcess saved it (S7); it is stored
+        # verbatim rather than re-serialized.
         import json as _json
-        record_json_str = (
+        record_json_str = data.get("record_json") or (
             _json.dumps(record, ensure_ascii=False) if record else ""
         )
         pdf_path = (
@@ -490,9 +541,20 @@ class MainApp:
     # ------------------------------------------------------------------
 
     def _on_exit(self) -> None:
-        """Prompt for confirmation before exiting."""
+        """Prompt for confirmation before exiting (not while sealing)."""
+        if not self._can_leave_view():
+            return
         if messagebox.askyesno(t("exit.title"), t("exit.confirm")):
             self.root.destroy()
+
+    def _on_close_request(self) -> None:
+        """The window's close button (X): the Exit guard, then close.
+
+        Like before E1b, X closes without the Exit menu's extra question.
+        """
+        if not self._can_leave_view():
+            return
+        self.root.destroy()
 
     def _on_about(self) -> None:
         """Show the about dialog."""

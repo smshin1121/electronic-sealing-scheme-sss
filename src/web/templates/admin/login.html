@@ -7,11 +7,21 @@
         <form method="POST" action="{{ url_for('admin.login') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <div class="mb-3">
-                <label for="password" class="form-label required">관리자 비밀번호</label>
-                <input type="password" class="form-control" id="password" name="password" required>
+                <label for="username" class="form-label required">관리자 계정명</label>
+                <input type="text" class="form-control" id="username" name="username"
+                       autocomplete="username" autocapitalize="none" spellcheck="false"
+                       maxlength="64" required>
+            </div>
+            <div class="mb-3">
+                <label for="password" class="form-label required">비밀번호</label>
+                <input type="password" class="form-control" id="password" name="password"
+                       autocomplete="current-password" required>
             </div>
             <button type="submit" class="btn btn-dark w-100">로그인</button>
         </form>
+        <p class="form-text mt-3">
+            관리자 계정은 서버에서 계정 관리 도구로 만듭니다. 기본 계정은 없습니다.
+        </p>
     </div>
 </div>
 {% endblock %}

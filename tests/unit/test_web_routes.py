@@ -60,44 +60,47 @@ class TestIndexRoute:
 # ===================================================================
 
 class TestAdminLogin:
-    """Admin access is disabled until a password is configured externally."""
+    """Admin login takes a named account; there is no built-in credential.
+
+    Stage E (E4) replaced the shared ``ADMIN_PASSWORD``: with no account
+    created, nobody can log in, and a configured shared password is
+    ignored. Named-account logins are covered in
+    ``tests/integration/test_admin_identity.py``.
+    """
 
     @staticmethod
-    def _set_csrf(client: Any) -> None:
+    def _post_login(client: Any, username: str, password: str) -> Any:
         with client.session_transaction() as sess:
             sess["csrf_token"] = "test-token"  # public-test-fixture
-
-    def test_missing_admin_password_fails_closed(
-        self, app: Any, client: Any
-    ) -> None:
-        app.config["ADMIN_PASSWORD"] = ""
-        self._set_csrf(client)
-
-        resp = client.post(
+        return client.post(
             "/admin/login",
             data={
-                "password": "any-value",  # public-test-fixture
-                "csrf_token": "test-token",  # public-test-fixture
-            },
-        )
-        assert resp.status_code == 503
-
-    def test_configured_admin_password_allows_login(
-        self, app: Any, client: Any
-    ) -> None:
-        app.config["ADMIN_PASSWORD"] = "test-only-admin-password"  # public-test-fixture
-        self._set_csrf(client)
-
-        resp = client.post(
-            "/admin/login",
-            data={
-                "password": "test-only-admin-password",  # public-test-fixture
+                "username": username,
+                "password": password,
                 "csrf_token": "test-token",  # public-test-fixture
             },
             follow_redirects=False,
         )
-        assert resp.status_code == 302
-        assert resp.headers["Location"].endswith("/admin/shares")
+
+    def test_no_account_means_no_login(self, app: Any, client: Any) -> None:
+        import secrets
+
+        resp = self._post_login(client, "admin", secrets.token_urlsafe(18))
+
+        assert resp.status_code == 401
+
+    def test_configured_shared_password_does_not_log_in(
+        self, app: Any, client: Any
+    ) -> None:
+        import secrets
+
+        shared = secrets.token_urlsafe(18)
+        app.config["ADMIN_PASSWORD"] = shared
+
+        resp = self._post_login(client, "admin", shared)
+
+        assert resp.status_code == 401
+        assert client.get("/admin/shares").status_code == 302
 
 
 # ===================================================================
@@ -368,7 +371,11 @@ class TestBirthDateFormatCompatibility:
     def test_register_case_normalizes_birth(
         self, app: Any, client: Any
     ) -> None:
-        """Registration stores the canonical YYYYMMDD form."""
+        """Registration digests the canonical YYYYMMDD form.
+
+        Stage E (E3a): the birth date is stored as a keyed digest of the
+        normalised value, and the plaintext column holds ''.
+        """
         with client.session_transaction() as sess:
             sess["csrf_token"] = "test-token"  # public-test-fixture
 
@@ -393,8 +400,16 @@ class TestBirthDateFormatCompatibility:
 
             row = find_case_by_seal_id("S-BIRTH-REG")
             assert row is not None
-            birth = row["suspect_birth"] if not isinstance(row, tuple) else row[6]
-            assert birth == "19900101"
+            assert row["suspect_birth"] == ""
+
+            from pathlib import Path
+
+            from web.privacy.digests import identity_digest
+
+            pepper = Path(app.config["IDENTITY_PEPPER_PATH"]).read_bytes()
+            assert row["suspect_birth_digest"] == identity_digest(
+                pepper, "birth_date", "S-BIRTH-REG", "19900101"
+            )
 
 
 # ===================================================================

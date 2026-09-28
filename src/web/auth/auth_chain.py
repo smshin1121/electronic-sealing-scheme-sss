@@ -6,33 +6,39 @@ Supports layered authentication:
   3. OTPAuthenticator    -- email OTP (optional, per-case)
 
 New authenticators can be added by subclassing BaseAuthenticator.
+
+Stage E (E3a): the basic step compares keyed digests of the normalised
+inputs with the digests stored for the case (:mod:`web.privacy`), never
+plaintext; the password step verifies a scrypt hash, or a v1.0.1 SHA-256
+hash in constant time (:mod:`web.auth.case_passwords`).
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
+
+# web.privacy.case_identity is imported where it is used: it needs
+# desktop.crypto, and the account CLI (python -m src.web.admin_accounts)
+# imports this package without src/ on the import path.
+from ..privacy.digests import normalize_birth_date, normalize_name, normalize_phone
+from .case_passwords import verify_case_password
 
 logger = logging.getLogger(__name__)
 
+# The basic step's answer to a wrong credential; the subject route gives the
+# same answer for a case whose identity was never converted (Fable gate,
+# finding 10), so a response does not show which cases those are.
+MSG_IDENTITY_MISMATCH = "입력한 정보가 일치하지 않습니다."
 
-def normalize_birth_date(value: str) -> str:
-    """Normalize a birth date string to canonical ``YYYYMMDD`` form.
-
-    Accepts both legacy (``19900101``) and HTML ``<input type="date">``
-    (``1990-01-01``) representations by extracting digits only, so that
-    stored and submitted values compare equal regardless of formatting.
-
-    Args:
-        value: Raw birth date string (may contain separators).
-
-    Returns:
-        Digits-only canonical string (empty string if no digits).
-    """
-    return "".join(ch for ch in (value or "") if ch.isdigit())
+# Re-exported: callers of v1.0.1 import it from here.
+__all__ = [
+    "AuthChain", "AuthResult", "BaseAuthenticator", "BasicAuthenticator",
+    "OTPAuthenticator", "PasswordAuthenticator", "normalize_birth_date",
+    "register_authenticator",
+]
 
 
 @dataclass(frozen=True)
@@ -72,7 +78,18 @@ class BaseAuthenticator(ABC):
 
 
 class BasicAuthenticator(BaseAuthenticator):
-    """Verify name + birth date + phone number."""
+    """Verify name + birth date + phone number against the stored digests.
+
+    Each input is normalised (name: NFC, whitespace collapsed; birth date
+    and phone: digits only, so formatting is ignored) and digested with
+    the server pepper; all three digests are compared in constant time
+    before the result is combined. An input with nothing left after
+    normalisation counts as missing.
+
+    Raises:
+        PrivacyUnavailable: The identity-protection keys are not configured.
+        LegacyIdentityError: The case's identity was never converted.
+    """
 
     @property
     def name(self) -> str:
@@ -83,37 +100,36 @@ class BasicAuthenticator(BaseAuthenticator):
         case: dict[str, Any],
         credentials: dict[str, Any],
     ) -> AuthResult:
-        input_name = (credentials.get("name") or "").strip()
-        input_birth = (credentials.get("birth_date") or "").strip()
-        input_phone = (credentials.get("phone") or "").strip()
+        input_name = credentials.get("name") or ""
+        input_birth = credentials.get("birth_date") or ""
+        input_phone = credentials.get("phone") or ""
 
-        if not input_name or not input_birth or not input_phone:
+        if not (normalize_name(input_name) and normalize_birth_date(input_birth)
+                and normalize_phone(input_phone)):
             return AuthResult(
                 success=False,
                 step=self.name,
                 message="이름, 생년월일, 연락처를 모두 입력해 주세요.",
             )
 
-        stored_name = case.get("suspect_name", "")
-        stored_birth = case.get("suspect_birth", "")
-        stored_phone = case.get("suspect_phone", "")
+        from ..privacy.case_identity import verify_basic_identity
 
-        if (
-            input_name == stored_name
-            and normalize_birth_date(input_birth) == normalize_birth_date(stored_birth)
-            and input_phone == stored_phone
-        ):
+        if verify_basic_identity(case, input_name, input_birth, input_phone):
             return AuthResult(success=True, step=self.name, message="기본 인증 성공")
 
         return AuthResult(
             success=False,
             step=self.name,
-            message="입력한 정보가 일치하지 않습니다.",
+            message=MSG_IDENTITY_MISMATCH,
         )
 
 
 class PasswordAuthenticator(BaseAuthenticator):
-    """Verify password (SHA-256 hash comparison)."""
+    """Verify the case password (scrypt, or a v1.0.1 SHA-256 hash).
+
+    A legacy hash is compared in constant time; the route replaces it by a
+    scrypt hash after a successful login (:mod:`web.auth.case_passwords`).
+    """
 
     @property
     def name(self) -> str:
@@ -132,10 +148,7 @@ class PasswordAuthenticator(BaseAuthenticator):
                 message="비밀번호를 입력해 주세요.",
             )
 
-        stored_hash = case.get("password_hash", "")
-        input_hash = hashlib.sha256(input_pw.encode("utf-8")).hexdigest()
-
-        if input_hash == stored_hash:
+        if verify_case_password(input_pw, case.get("password_hash", "")):
             return AuthResult(success=True, step=self.name, message="비밀번호 인증 성공")
 
         return AuthResult(

@@ -6,12 +6,16 @@ All queries use parameterized placeholders to prevent SQL injection.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import sqlite3
-from contextlib import contextmanager
-from typing import Any, Generator
+from typing import Any
 
 from flask import Flask, g
+
+from .migrations import apply_migrations
+from .privacy_schema import MARIADB_PRIVACY_SCHEMA, SQLITE_PRIVACY_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,13 @@ CREATE TABLE IF NOT EXISTS cases (
     auth_level  TEXT    NOT NULL DEFAULT 'basic',
     password_hash TEXT  NOT NULL DEFAULT '',
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    suspect_name_digest  TEXT NOT NULL DEFAULT '',
+    suspect_birth_digest TEXT NOT NULL DEFAULT '',
+    suspect_phone_digest TEXT NOT NULL DEFAULT '',
+    suspect_name_enc     TEXT NOT NULL DEFAULT '',
+    suspect_email_enc    TEXT NOT NULL DEFAULT '',
+    identity_scheme      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -75,6 +85,7 @@ CREATE TABLE IF NOT EXISTS seal_records (
     record_json TEXT    NOT NULL,
     record_pdf  BLOB,
     synced_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    record_scheme TEXT  NOT NULL DEFAULT '',
     FOREIGN KEY (seal_id) REFERENCES cases(seal_id),
     UNIQUE(seal_id, event_id)
 );
@@ -91,6 +102,54 @@ CREATE INDEX IF NOT EXISTS idx_auth_failures_lookup
 
 CREATE INDEX IF NOT EXISTS idx_key_shares_index_uploaded
     ON key_shares (share_index, uploaded_at);
+
+CREATE TABLE IF NOT EXISTS wrapped_s3_shares (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_id     TEXT    NOT NULL,
+    event_id    INTEGER NOT NULL,
+    wrapped_s3  BLOB    NOT NULL,
+    synced_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (seal_id) REFERENCES cases(seal_id),
+    UNIQUE(seal_id, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS release_audit (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_id          TEXT    NOT NULL,
+    path             TEXT    NOT NULL CHECK(path IN ('standard','timelock','admin')),
+    policy_status    TEXT    NOT NULL,
+    policy_digest    TEXT    NOT NULL,
+    outcome          TEXT    NOT NULL CHECK(outcome IN ('released','denied')),
+    reason           TEXT    NOT NULL,
+    detail           TEXT    NOT NULL,
+    operator_reason  TEXT    NOT NULL,
+    tsa_token_sha256 TEXT    NOT NULL,
+    tsa_token        TEXT    NOT NULL,
+    tsa_challenge    TEXT    NOT NULL,
+    tsa_gen_time     TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL,
+    operator         TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_audit_seal
+    ON release_audit (seal_id, id);
+
+CREATE TABLE IF NOT EXISTS policy_enrollment (
+    seal_id        TEXT    PRIMARY KEY,
+    event_id       INTEGER NOT NULL,
+    policy_digest  TEXT    NOT NULL,
+    enrolled_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (seal_id) REFERENCES cases(seal_id)
+);
+
+CREATE TABLE IF NOT EXISTS admin_accounts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT    NOT NULL UNIQUE,
+    password_hash TEXT    NOT NULL,
+    disabled      INTEGER NOT NULL DEFAULT 0 CHECK(disabled IN (0, 1)),
+    created_at    TEXT    NOT NULL,
+    disabled_at   TEXT    NOT NULL DEFAULT ''
+);
 """
 
 _MARIADB_SCHEMA = """
@@ -106,7 +165,13 @@ CREATE TABLE IF NOT EXISTS cases (
     auth_level   VARCHAR(32)  NOT NULL DEFAULT 'basic',
     password_hash VARCHAR(256) NOT NULL DEFAULT '',
     created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    suspect_name_digest  VARCHAR(64) NOT NULL DEFAULT '',
+    suspect_birth_digest VARCHAR(64) NOT NULL DEFAULT '',
+    suspect_phone_digest VARCHAR(64) NOT NULL DEFAULT '',
+    suspect_name_enc     TEXT        NOT NULL DEFAULT '',
+    suspect_email_enc    TEXT        NOT NULL DEFAULT '',
+    identity_scheme      VARCHAR(16) NOT NULL DEFAULT ''
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS users (
@@ -140,6 +205,7 @@ CREATE TABLE IF NOT EXISTS seal_records (
     record_json  LONGTEXT    NOT NULL,
     record_pdf   LONGBLOB,
     synced_at    DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    record_scheme VARCHAR(16) NOT NULL DEFAULT '',
     FOREIGN KEY (seal_id) REFERENCES cases(seal_id),
     UNIQUE KEY uq_seal_event (seal_id, event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -156,6 +222,55 @@ CREATE INDEX IF NOT EXISTS idx_auth_failures_lookup
 
 CREATE INDEX IF NOT EXISTS idx_key_shares_index_uploaded
     ON key_shares (share_index, uploaded_at);
+
+CREATE TABLE IF NOT EXISTS wrapped_s3_shares (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    seal_id     VARCHAR(64) NOT NULL,
+    event_id    INT         NOT NULL,
+    wrapped_s3  BLOB        NOT NULL,
+    synced_at   DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (seal_id) REFERENCES cases(seal_id),
+    UNIQUE KEY uq_wrapped_s3_event (seal_id, event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS release_audit (
+    id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    seal_id          VARCHAR(64)  NOT NULL,
+    path             ENUM('standard','timelock','admin') NOT NULL,
+    policy_status    VARCHAR(32)  NOT NULL,
+    policy_digest    VARCHAR(64)  NOT NULL,
+    outcome          ENUM('released','denied') NOT NULL,
+    reason           VARCHAR(64)  NOT NULL,
+    detail           VARCHAR(512) NOT NULL,
+    operator_reason  TEXT         NOT NULL,
+    tsa_token_sha256 VARCHAR(64)  NOT NULL,
+    tsa_token        TEXT         NOT NULL,
+    tsa_challenge    VARCHAR(64)  NOT NULL,
+    tsa_gen_time     VARCHAR(40)  NOT NULL,
+    created_at       VARCHAR(40)  NOT NULL,
+    operator         VARCHAR(64)  NOT NULL DEFAULT ''
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX IF NOT EXISTS idx_release_audit_seal
+    ON release_audit (seal_id, id);
+
+CREATE TABLE IF NOT EXISTS policy_enrollment (
+    seal_id        VARCHAR(64)  NOT NULL PRIMARY KEY,
+    event_id       INT          NOT NULL,
+    policy_digest  VARCHAR(64)  NOT NULL,
+    enrolled_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (seal_id) REFERENCES cases(seal_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS admin_accounts (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    username      VARCHAR(64)  COLLATE utf8mb4_bin NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    disabled      TINYINT      NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1)),
+    created_at    VARCHAR(40)  NOT NULL,
+    disabled_at   VARCHAR(40)  NOT NULL DEFAULT '',
+    UNIQUE KEY uq_admin_username (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 
@@ -240,21 +355,31 @@ def init_db(app: Flask) -> None:
         app: The Flask application instance.
     """
     with app.app_context():
-        db = get_db()
-        db_type = g.get("db_type", "sqlite")
+        create_schema(get_db(), g.get("db_type", "sqlite"))
+        close_db()
 
-        if db_type == "sqlite":
-            db.executescript(_SQLITE_SCHEMA)
-        else:
-            cursor = db.cursor()
-            for statement in _MARIADB_SCHEMA.strip().split(";"):
+
+def create_schema(db: Any, db_type: str) -> None:
+    """Create any missing table, then migrate existing ones (idempotent).
+
+    Split out of :func:`init_db` so that a caller that must first check
+    which backend it reached (the account CLI) can use one connection.
+    The identity-protection tables (:mod:`web.models.privacy_schema`) are
+    created after the main tables they refer to.
+    """
+    if db_type == "sqlite":
+        db.executescript(_SQLITE_SCHEMA + SQLITE_PRIVACY_SCHEMA)
+    else:
+        cursor = db.cursor()
+        try:
+            for statement in (_MARIADB_SCHEMA + MARIADB_PRIVACY_SCHEMA).strip().split(";"):
                 stmt = statement.strip()
                 if stmt:
                     cursor.execute(stmt)
             db.commit()
+        finally:
             cursor.close()
-
-        close_db()
+    apply_migrations(db, db_type)
 
 
 # ---------------------------------------------------------------------------
@@ -313,23 +438,29 @@ def insert_case(
     auth_level: str = "basic",
     password_hash: str = "",
 ) -> int | None:
-    """Insert a new case record.
+    """Insert a new case; the subject's identity is stored protected (E3a).
+
+    The v1.0.1 signature is kept for existing callers, but the four
+    identity arguments are only inputs to
+    :func:`web.privacy.case_identity.register_protected_case`, which stores
+    keyed digests (name, birth date, phone) and ciphertexts (name, e-mail)
+    under a new per-seal data key and leaves the plaintext columns ''.
+    It therefore needs the identity-protection keys. ``password_hash`` is
+    stored as given.
 
     Returns:
-        The inserted row ID, or None on failure.
+        The inserted row ID.
+
+    Raises:
+        PrivacyUnavailable: The identity-protection keys are not configured.
     """
-    return execute_query(
-        """INSERT INTO cases
-           (seal_id, case_number, investigator, suspect_name,
-            suspect_email, suspect_birth, suspect_phone,
-            auth_level, password_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            seal_id, case_number, investigator, suspect_name,
-            suspect_email, suspect_birth, suspect_phone,
-            auth_level, password_hash,
-        ),
-    )
+    from ..privacy.case_identity import CaseRegistration, register_protected_case
+
+    return register_protected_case(CaseRegistration(
+        seal_id=seal_id, case_number=case_number, investigator=investigator,
+        name=suspect_name, email=suspect_email, birth=suspect_birth,
+        phone=suspect_phone, auth_level=auth_level, password_hash=password_hash,
+    ))
 
 
 def find_case_by_seal_id(seal_id: str) -> Any:
@@ -397,82 +528,74 @@ def insert_seal_record(
     record_json: str,
     record_pdf: bytes | None = None,
 ) -> int | None:
-    """Insert a seal record (idempotent: ignores duplicates).
+    """Insert a seal record, encrypted (idempotent: ignores duplicates).
+
+    Since stage E, E3b the record is stored through
+    :func:`web.models.release_models.insert_protected_record`: both columns
+    encrypted under the seal's data key; it needs the privacy keys.
 
     Returns:
-        The inserted row ID, or None if duplicate.
+        The cursor's last row id.
     """
-    db = get_db()
-    db_type = g.get("db_type", "sqlite")
+    from .release_models import insert_protected_record
 
-    if db_type == "sqlite":
-        sql = """INSERT OR IGNORE INTO seal_records
-                 (seal_id, event_id, event_type, record_json, record_pdf)
-                 VALUES (?, ?, ?, ?, ?)"""
-    else:
-        sql = """INSERT IGNORE INTO seal_records
-                 (seal_id, event_id, event_type, record_json, record_pdf)
-                 VALUES (%s, %s, %s, %s, %s)"""
-
-    cursor = db.cursor()
-    try:
-        cursor.execute(sql, (seal_id, event_id, event_type, record_json, record_pdf))
-        db.commit()
-        return cursor.lastrowid
-    finally:
-        cursor.close()
+    return insert_protected_record(seal_id, event_id, event_type, record_json,
+                                   record_pdf)
 
 
-def find_seal_records_by_seal_id(seal_id: str) -> list[Any]:
-    """Find all seal records for a given seal_id ordered by event_id.
+def find_seal_records_by_seal_id(seal_id: str) -> list[dict[str, Any]]:
+    """All records of a seal by event, decrypted (a system read, not audited;
+    person-facing reads go through :mod:`web.privacy.record_access`).
 
     Returns:
-        List of row dicts/tuples.
+        Dicts with ``id, seal_id, event_id, event_type, record_json,
+        record_pdf, synced_at`` (see
+        :func:`web.models.release_models.find_seal_records`).
     """
-    return execute_query(
-        "SELECT * FROM seal_records WHERE seal_id = ? ORDER BY event_id",
-        (seal_id,),
-        fetch_all=True,
-    ) or []
+    from .release_models import find_seal_records
+
+    return find_seal_records(seal_id)
 
 
 def find_seal_record_summaries_by_seal_id(seal_id: str) -> list[Any]:
     """Find seal record summaries (list view) for a given seal_id.
 
-    Excludes the heavy ``record_json`` / ``record_pdf`` columns so that
-    listing pages do not load large payloads. Use
-    :func:`find_seal_record_json` for the detail view.
+    Reads no record content (nothing is decrypted): the list page shows
+    the event, its type and time, and whether a PDF is stored. A person
+    sees the content only through :mod:`web.privacy.record_access`.
 
     Returns:
         List of row dicts/tuples with
-        (id, seal_id, event_id, event_type, synced_at).
+        (id, seal_id, event_id, event_type, synced_at, has_pdf).
     """
     return execute_query(
-        """SELECT id, seal_id, event_id, event_type, synced_at
+        """SELECT id, seal_id, event_id, event_type, synced_at,
+                  CASE WHEN record_pdf IS NULL THEN 0 ELSE 1 END AS has_pdf
            FROM seal_records WHERE seal_id = ? ORDER BY event_id""",
         (seal_id,),
         fetch_all=True,
     ) or []
 
 
-def find_seal_record_json(seal_id: str, event_id: int) -> str | None:
-    """Fetch the record_json payload of a single seal record.
+def _latest_record(seal_id: str) -> dict | None:
+    """The newest synced record of a seal, parsed; None when none is stored.
 
-    Returns:
-        The record JSON string, or None if not found.
+    Raises:
+        ValueError: The record is unreadable (not JSON, or it does not
+            decrypt). A record stored before E3b, or missing privacy keys,
+            raise the privacy errors instead (fail-closed).
     """
-    row = execute_query(
-        "SELECT record_json FROM seal_records WHERE seal_id = ? AND event_id = ?",
-        (seal_id, event_id),
-        fetch_one=True,
-    )
-    if row is None:
+    from .release_models import find_latest_record_json
+
+    record_json = find_latest_record_json(seal_id)
+    if record_json is None:
         return None
-    if isinstance(row, dict):
-        return row.get("record_json")
-    if hasattr(row, "keys"):
-        return row["record_json"]
-    return row[0]
+    try:
+        return json.loads(record_json)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"seal_records.record_json unreadable for {seal_id}"
+        ) from exc
 
 
 def find_latest_seal_mode(seal_id: str) -> str | None:
@@ -489,24 +612,9 @@ def find_latest_seal_mode(seal_id: str) -> str | None:
             treat this as a recovery denial (fail-closed): a present but
             unverifiable mode must never silently degrade to standard.
     """
-    import json as _json
-
-    records = find_seal_records_by_seal_id(seal_id)
-    if not records:
+    record = _latest_record(seal_id)
+    if record is None:
         return None
-
-    latest = records[-1]
-    if isinstance(latest, dict) or hasattr(latest, "keys"):
-        record_json = latest["record_json"]
-    else:
-        record_json = latest[4]
-
-    try:
-        record = _json.loads(record_json)
-    except (ValueError, TypeError) as exc:
-        raise ValueError(
-            f"seal_records.record_json unreadable for {seal_id}"
-        ) from exc
 
     mode = record.get("seal_mode", "standard")
     if mode not in ("standard", "strict"):
@@ -531,24 +639,9 @@ def find_latest_unlock_time(seal_id: str) -> str | None:
     Raises:
         ValueError: When a record exists but its JSON is unreadable.
     """
-    import json as _json
-
-    records = find_seal_records_by_seal_id(seal_id)
-    if not records:
+    record = _latest_record(seal_id)
+    if record is None:
         return None
-
-    latest = records[-1]
-    if isinstance(latest, dict) or hasattr(latest, "keys"):
-        record_json = latest["record_json"]
-    else:
-        record_json = latest[4]
-
-    try:
-        record = _json.loads(record_json)
-    except (ValueError, TypeError) as exc:
-        raise ValueError(
-            f"seal_records.record_json unreadable for {seal_id}"
-        ) from exc
 
     unlock = record.get("unlock_time_iso") or record.get("unlock_time")
     return unlock if isinstance(unlock, str) and unlock else None
@@ -568,30 +661,14 @@ def find_latest_key_commitment(seal_id: str) -> str | None:
             commitment must never be treated as "absent": that would let
             a rewritten record silently disable verification.
     """
-    import json as _json
-    import re as _re
-
-    records = find_seal_records_by_seal_id(seal_id)
-    if not records:
+    record = _latest_record(seal_id)
+    if record is None:
         return None
-
-    latest = records[-1]
-    if isinstance(latest, dict) or hasattr(latest, "keys"):
-        record_json = latest["record_json"]
-    else:
-        record_json = latest[4]
-
-    try:
-        record = _json.loads(record_json)
-    except (ValueError, TypeError) as exc:
-        raise ValueError(
-            f"seal_records.record_json unreadable for {seal_id}"
-        ) from exc
 
     commitment = record.get("key_commitment")
     if commitment in (None, ""):
         return None
-    if not isinstance(commitment, str) or not _re.fullmatch(
+    if not isinstance(commitment, str) or not re.fullmatch(
         r"[0-9a-f]{64}", commitment
     ):
         raise ValueError(
@@ -615,12 +692,23 @@ def find_admin_share_summaries() -> list[Any]:
     ) or []
 
 
-def record_auth_failure(seal_id: str, ip_address: str) -> None:
-    """Record an authentication failure."""
-    execute_query(
+def record_auth_failure(seal_id: str, ip_address: str) -> int | None:
+    """Record (and commit) an authentication failure; returns its row id."""
+    return execute_query(
         "INSERT INTO auth_failures (seal_id, ip_address) VALUES (?, ?)",
         (seal_id, ip_address),
     )
+
+
+def delete_auth_failure(row_id: int) -> None:
+    """Remove one recorded failure by row id (a withdrawn reservation)."""
+    execute_query("DELETE FROM auth_failures WHERE id = ?", (row_id,))
+
+
+def relabel_auth_failure(row_id: int, seal_id: str) -> None:
+    """Move one row to another key (a reservation that became a failure)."""
+    execute_query("UPDATE auth_failures SET seal_id = ? WHERE id = ?",
+                  (seal_id, row_id))
 
 
 def count_recent_auth_failures(

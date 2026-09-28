@@ -4,14 +4,31 @@ Provides a minimal Time Stamping Authority that accepts TSQ requests
 via HTTP POST and returns TSR responses with signed TST tokens.
 Uses system time (assumes NTP synchronization) and auto-incrementing
 serial numbers.
+
+Token profile (stage E, E2b): the SignerInfo carries signed attributes
+(content-type id-ct-TSTInfo, message-digest of the TSTInfo, and an ESS
+signing-certificate-v2 attribute naming the TSA certificate by its
+SHA-256 hash, RFC 5816) and the RSA PKCS#1 v1.5 signature covers those
+attributes. Every TSTInfo carries the TSA policy OID and an accuracy;
+both are server parameters (defaults :data:`DEFAULT_TSA_POLICY_OID` and
+:data:`DEFAULT_TSA_ACCURACY`).
+
+Requests (Fable gate, finding 8): the body is read only when Content-Length
+is a decimal byte count from 1 to :data:`MAX_TSQ_BYTES`; a larger one is
+answered HTTP 413, a missing (chunked), malformed or zero one HTTP 400,
+without reading the body. A body that is not a TimeStampReq is answered
+with a rejection TSR (``bad_request``). There is no read timeout: a client
+that declares a length and sends less holds one handler thread (a
+reference component on loopback).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -23,11 +40,20 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.x509 import Certificate, load_pem_x509_certificate
 
 from .exceptions import TSAError
+from .tsa_profile import TimeStampResponse, is_dotted_oid
 
 logger = logging.getLogger(__name__)
 
-# TSA policy OID (custom for this system)
-_TSA_POLICY_OID = "1.2.3.4.5.6.7.8.9"
+# Policy OID of the local TSA. A placeholder, not a registered OID: a
+# deployment pins the policy OID its own TSA asserts (on the release host,
+# RELEASE_TSA_POLICY_OID), whatever that TSA is.
+DEFAULT_TSA_POLICY_OID = "1.2.3.4.5.6.7.8.9"
+# Accuracy the local TSA asserts around genTime (RFC 3161 section 2.4.2).
+DEFAULT_TSA_ACCURACY = timedelta(seconds=1)
+# Largest request body read (Fable gate, finding 8). A TimeStampReq is
+# about a hundred bytes (imprint, nonce, certReq; a policy or extensions
+# add little); a larger or undeclared length is refused unread.
+MAX_TSQ_BYTES = 16 * 1024
 _DEFAULT_TSA_DIR = Path.home() / ".enc_envelope" / "tsa"
 _TSA_KEY_PASSWORD_ENV = "ENC_ENVELOPE_TSA_KEY_PASSWORD"  # public-config-key
 _TSA_CA_KEY_PASSWORD_ENV = "ENC_ENVELOPE_TSA_CA_KEY_PASSWORD"  # public-config-key
@@ -56,6 +82,42 @@ def _resolve_credential_password(
     return value
 
 
+def _utc_now() -> datetime:
+    """The TSA clock: system UTC time (assumed NTP-synchronised).
+
+    Test seam only: tests monkeypatch this module-level function to pin
+    genTime. Production code never replaces it.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _validated_options(policy_oid: str, accuracy: timedelta) -> None:
+    """Refuse a malformed policy OID or accuracy before serving (fail early)."""
+    if not is_dotted_oid(policy_oid):
+        raise TSAError(f"TSA policy OID is not a dotted OID: {policy_oid!r}")
+    if not isinstance(accuracy, timedelta) or accuracy < timedelta(0):
+        raise TSAError("TSA accuracy must be a non-negative timedelta")
+
+
+def _accuracy_value(accuracy: timedelta) -> tsp.Accuracy:
+    """RFC 3161 Accuracy: whole seconds, then millis and micros (1..999).
+
+    Zero components are omitted, as the ASN.1 ranges require; a zero
+    accuracy is sent as ``seconds 0`` so the field is never empty.
+    """
+    micros_total = accuracy // timedelta(microseconds=1)
+    seconds, rest = divmod(micros_total, 1_000_000)
+    millis, micros = divmod(rest, 1_000)
+    fields: dict[str, int] = {}
+    if seconds or not rest:
+        fields["seconds"] = seconds
+    if millis:
+        fields["millis"] = millis
+    if micros:
+        fields["micros"] = micros
+    return tsp.Accuracy(fields)
+
+
 class _SerialCounter:
     """Thread-safe auto-incrementing serial number counter."""
 
@@ -71,17 +133,22 @@ class _SerialCounter:
 
 
 class _TSAContext:
-    """Holds TSA server state: key, certificate, serial counter."""
+    """Holds TSA server state: key, certificate, serial counter, profile."""
 
     def __init__(
         self,
         tsa_key: RSAPrivateKey,
         tsa_cert: Certificate,
         tsa_cert_der: bytes,
+        *,
+        policy_oid: str = DEFAULT_TSA_POLICY_OID,
+        accuracy: timedelta = DEFAULT_TSA_ACCURACY,
     ) -> None:
         self.tsa_key = tsa_key
         self.tsa_cert = tsa_cert
         self.tsa_cert_der = tsa_cert_der
+        self.policy_oid = policy_oid
+        self.accuracy = accuracy
         self.serial_counter = _SerialCounter()
 
 
@@ -90,6 +157,9 @@ def _build_tst_info(
     serial_number: int,
     gen_time: datetime,
     nonce: int | None = None,
+    *,
+    policy_oid: str = DEFAULT_TSA_POLICY_OID,
+    accuracy: timedelta = DEFAULT_TSA_ACCURACY,
 ) -> tsp.TSTInfo:
     """Build a TSTInfo structure.
 
@@ -97,24 +167,65 @@ def _build_tst_info(
         message_imprint: The hash from the TSQ.
         serial_number: Unique serial number for this token.
         gen_time: Timestamp generation time.
+        nonce: The request nonce to echo, if the TSQ carried one.
+        policy_oid: TSA policy under which the token is issued.
+        accuracy: Accuracy asserted around genTime (always emitted).
 
     Returns:
         TSTInfo ASN.1 structure.
     """
     tst_info = {
         "version": "v1",
-        "policy": _TSA_POLICY_OID,
+        "policy": policy_oid,
         "message_imprint": message_imprint,
         "serial_number": serial_number,
         "gen_time": gen_time,
-        "accuracy": tsp.Accuracy({
-            "seconds": 1,
-        }),
+        "accuracy": _accuracy_value(accuracy),
         "ordering": False,
     }
     if nonce is not None:
         tst_info["nonce"] = nonce
     return tsp.TSTInfo(tst_info)
+
+
+def _cms_attribute(name: str, value: object) -> cms.CMSAttribute:
+    """A single-valued CMS attribute."""
+    return cms.CMSAttribute({
+        "type": cms.CMSAttributeType(name),
+        "values": [value],
+    })
+
+
+def _signing_certificate_v2(
+    cert_asn1: asn1_x509.Certificate,
+) -> tsp.SigningCertificateV2:
+    """ESS signing-certificate-v2 (RFC 5035/5816) naming the TSA certificate.
+
+    ESSCertIDv2 with SHA-256 (the DEFAULT hash algorithm, so DER omits it)
+    over the certificate DER, plus issuerSerial.
+    """
+    return tsp.SigningCertificateV2({
+        "certs": [tsp.ESSCertIDv2({
+            "cert_hash": hashlib.sha256(cert_asn1.dump()).digest(),
+            "issuer_serial": tsp.IssuerSerial({
+                "issuer": [
+                    asn1_x509.GeneralName({"directory_name": cert_asn1.issuer}),
+                ],
+                "serial_number": cert_asn1.serial_number,
+            }),
+        })],
+    })
+
+
+def _signed_attributes(
+    tst_info_bytes: bytes, cert_asn1: asn1_x509.Certificate
+) -> cms.CMSAttributes:
+    """content-type, message-digest and signing-certificate-v2 (DER SET OF)."""
+    return cms.CMSAttributes([
+        _cms_attribute("content_type", cms.ContentType("tst_info")),
+        _cms_attribute("message_digest", hashlib.sha256(tst_info_bytes).digest()),
+        _cms_attribute("signing_certificate_v2", _signing_certificate_v2(cert_asn1)),
+    ])
 
 
 def _sign_tst_info(
@@ -124,6 +235,9 @@ def _sign_tst_info(
 ) -> bytes:
     """Create a CMS SignedData wrapping the TSTInfo.
 
+    The signature covers the DER encoding of the signed attributes
+    (RFC 5652 section 5.4), whose message-digest binds the TSTInfo.
+
     Args:
         tst_info_bytes: DER-encoded TSTInfo.
         tsa_key: TSA private key for signing.
@@ -132,35 +246,26 @@ def _sign_tst_info(
     Returns:
         DER-encoded ContentInfo (SignedData) bytes.
     """
-    # Compute digest of the TSTInfo
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(tst_info_bytes)
-    tst_digest = digest.finalize()
-
-    # Sign the TSTInfo
+    cert_asn1 = asn1_x509.Certificate.load(tsa_cert_der)
+    signed_attrs = _signed_attributes(tst_info_bytes, cert_asn1)
     signature = tsa_key.sign(
-        tst_info_bytes,
+        signed_attrs.dump(),
         padding.PKCS1v15(),
         hashes.SHA256(),
     )
 
-    # Parse the TSA certificate for ASN.1 fields
-    cert_asn1 = asn1_x509.Certificate.load(tsa_cert_der)
-    issuer = cert_asn1["tbs_certificate"]["issuer"]
-    serial = cert_asn1["tbs_certificate"]["serial_number"]
-
-    # Build SignerInfo
     signer_info = cms.SignerInfo({
         "version": "v1",
         "sid": cms.SignerIdentifier({
             "issuer_and_serial_number": cms.IssuerAndSerialNumber({
-                "issuer": issuer,
-                "serial_number": serial,
+                "issuer": cert_asn1.issuer,
+                "serial_number": cert_asn1.serial_number,
             }),
         }),
         "digest_algorithm": algos.DigestAlgorithm({
             "algorithm": "sha256",
         }),
+        "signed_attrs": signed_attrs,
         "signature_algorithm": algos.SignedDigestAlgorithm({
             "algorithm": "sha256_rsa",
         }),
@@ -211,9 +316,12 @@ def _process_tsq(tsq_bytes: bytes, ctx: _TSAContext) -> bytes:
     message_imprint = tsq["message_imprint"]
     nonce = tsq["nonce"].native if "nonce" in tsq and tsq["nonce"].native is not None else None
     serial = ctx.serial_counter.next()
-    gen_time = datetime.now(timezone.utc)
+    gen_time = _utc_now()
 
-    tst_info = _build_tst_info(message_imprint, serial, gen_time, nonce=nonce)
+    tst_info = _build_tst_info(
+        message_imprint, serial, gen_time, nonce=nonce,
+        policy_oid=ctx.policy_oid, accuracy=ctx.accuracy,
+    )
     tst_info_bytes = tst_info.dump()
 
     try:
@@ -243,16 +351,21 @@ def _process_tsq(tsq_bytes: bytes, ctx: _TSAContext) -> bytes:
 def _build_error_tsr(fail_reason: str) -> bytes:
     """Build an error TimeStampResp.
 
+    PKIFailureInfo is a BIT STRING of named bits, so asn1crypto takes the
+    set of set bits, and the reply carries no token, which asn1crypto's own
+    TimeStampResp cannot encode. Before the Fable gate round both failed,
+    and a malformed request closed the connection without an answer.
+
     Args:
         fail_reason: One of the PKIFailureInfo values.
 
     Returns:
         DER-encoded error TSR bytes.
     """
-    tsr = tsp.TimeStampResp({
+    tsr = TimeStampResponse({  # token OPTIONAL, unlike tsp.TimeStampResp
         "status": tsp.PKIStatusInfo({
             "status": "rejection",
-            "fail_info": fail_reason,
+            "fail_info": {fail_reason},
         }),
     })
     return tsr.dump()
@@ -262,6 +375,9 @@ def _load_tsa_credentials(
     tsa_key_path: str | Path,
     tsa_cert_path: str | Path,
     key_password: str,
+    *,
+    policy_oid: str = DEFAULT_TSA_POLICY_OID,
+    accuracy: timedelta = DEFAULT_TSA_ACCURACY,
 ) -> _TSAContext:
     """Load TSA key and certificate from PEM files.
 
@@ -269,6 +385,8 @@ def _load_tsa_credentials(
         tsa_key_path: Path to the TSA private key PEM file.
         tsa_cert_path: Path to the TSA certificate PEM file.
         key_password: Password for the encrypted key file.
+        policy_oid: TSA policy OID written into every TSTInfo.
+        accuracy: Accuracy written into every TSTInfo.
 
     Returns:
         _TSAContext with loaded credentials.
@@ -295,12 +413,33 @@ def _load_tsa_credentials(
         cert = load_pem_x509_certificate(cert_path.read_bytes())
         cert_der = cert.public_bytes(serialization.Encoding.DER)
 
-        return _TSAContext(tsa_key=key, tsa_cert=cert, tsa_cert_der=cert_der)
+        return _TSAContext(
+            tsa_key=key, tsa_cert=cert, tsa_cert_der=cert_der,
+            policy_oid=policy_oid, accuracy=accuracy,
+        )
 
     except TSAError:
         raise
     except Exception as exc:
         raise TSAError(f"Failed to load TSA credentials: {exc}") from exc
+
+
+def _request_length(header: Optional[str]) -> tuple[int, Optional[tuple[int, str]]]:
+    """The TSQ length to read, or the HTTP error that refuses the request.
+
+    Only ASCII digits from 1 to :data:`MAX_TSQ_BYTES` are accepted. A
+    missing length (chunked requests included), a malformed, signed or zero
+    one is 400; a larger one is 413. The body is not read in either case.
+    """
+    text = (header or "").strip()
+    if not (text.isascii() and text.isdigit()):
+        return 0, (400, "Content-Length with a decimal byte count required")
+    length = int(text)
+    if length == 0:
+        return 0, (400, "Empty request body")
+    if length > MAX_TSQ_BYTES:
+        return 0, (413, f"Request body larger than {MAX_TSQ_BYTES} bytes")
+    return length, None
 
 
 class _TSARequestHandler(BaseHTTPRequestHandler):
@@ -314,9 +453,13 @@ class _TSARequestHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length <= 0:
-            self.send_error(400, "Empty request body")
+        content_length, refusal = _request_length(
+            self.headers.get("Content-Length")
+        )
+        if refusal is not None:
+            # The body is never read, so the connection cannot be reused.
+            self.close_connection = True
+            self.send_error(*refusal)
             return
 
         tsq_bytes = self.rfile.read(content_length)
@@ -340,6 +483,9 @@ def create_tsa_server(
     key_password: str | None = None,
     host: str = "127.0.0.1",
     port: int = 3161,
+    *,
+    policy_oid: str = DEFAULT_TSA_POLICY_OID,
+    accuracy: timedelta = DEFAULT_TSA_ACCURACY,
 ) -> HTTPServer:
     """Create an RFC 3161 compatible HTTP TSA server.
 
@@ -351,14 +497,19 @@ def create_tsa_server(
         tsa_cert_path: Path to the TSA certificate PEM file.
         key_password: Password for the encrypted key file.
         host: Bind address. Defaults to localhost.
-        port: Bind port. Defaults to 3161.
+        port: Bind port. Defaults to 3161; 0 binds an ephemeral port
+            (read it from ``server.server_address[1]``).
+        policy_oid: TSA policy OID asserted in every token (dotted form).
+        accuracy: Accuracy asserted in every token (non-negative).
 
     Returns:
         HTTPServer instance (call ``serve_forever()`` to start).
 
     Raises:
-        TSAError: If credentials cannot be loaded or server creation fails.
+        TSAError: If an option is malformed, credentials cannot be loaded
+            or server creation fails.
     """
+    _validated_options(policy_oid, accuracy)
     resolved_password = _resolve_credential_password(
         key_password,
         env_name=_TSA_KEY_PASSWORD_ENV,
@@ -368,6 +519,8 @@ def create_tsa_server(
         tsa_key_path,
         tsa_cert_path,
         resolved_password,
+        policy_oid=policy_oid,
+        accuracy=accuracy,
     )
 
     # Create a handler class bound to this context
@@ -381,7 +534,8 @@ def create_tsa_server(
         # ThreadingHTTPServer handles each request on its own daemon
         # thread so concurrent TSQ requests don't serialize.
         server = ThreadingHTTPServer((host, port), handler_class)
-        logger.info("TSA server created at http://%s:%d/tsa", host, port)
+        logger.info("TSA server created at http://%s:%d/tsa", host,
+                    server.server_address[1])
         return server
     except Exception as exc:
         raise TSAError(f"Failed to create TSA server: {exc}") from exc
@@ -393,6 +547,9 @@ def run_tsa_server(
     key_password: str | None = None,
     host: str = "127.0.0.1",
     port: int = 3161,
+    *,
+    policy_oid: str = DEFAULT_TSA_POLICY_OID,
+    accuracy: timedelta = DEFAULT_TSA_ACCURACY,
 ) -> None:
     """Create and run the TSA server (blocking).
 
@@ -402,9 +559,12 @@ def run_tsa_server(
         key_password: Password for the encrypted key file.
         host: Bind address. Defaults to localhost.
         port: Bind port. Defaults to 3161.
+        policy_oid: TSA policy OID asserted in every token.
+        accuracy: Accuracy asserted in every token.
     """
     server = create_tsa_server(
-        tsa_key_path, tsa_cert_path, key_password, host, port
+        tsa_key_path, tsa_cert_path, key_password, host, port,
+        policy_oid=policy_oid, accuracy=accuracy,
     )
     logger.info("TSA server starting on http://%s:%d/tsa", host, port)
     try:
@@ -421,6 +581,9 @@ def start_tsa_server_background(
     key_password: str | None = None,
     host: str = "127.0.0.1",
     port: int = 3161,
+    *,
+    policy_oid: str = DEFAULT_TSA_POLICY_OID,
+    accuracy: timedelta = DEFAULT_TSA_ACCURACY,
 ) -> tuple[HTTPServer, threading.Thread]:
     """Start the TSA server in a background daemon thread.
 
@@ -429,13 +592,16 @@ def start_tsa_server_background(
         tsa_cert_path: Path to the TSA certificate PEM file.
         key_password: Password for the encrypted key file.
         host: Bind address. Defaults to localhost.
-        port: Bind port. Defaults to 3161.
+        port: Bind port. Defaults to 3161; 0 binds an ephemeral port.
+        policy_oid: TSA policy OID asserted in every token.
+        accuracy: Accuracy asserted in every token.
 
     Returns:
         Tuple of (server, thread). Call ``server.shutdown()`` to stop.
     """
     server = create_tsa_server(
-        tsa_key_path, tsa_cert_path, key_password, host, port
+        tsa_key_path, tsa_cert_path, key_password, host, port,
+        policy_oid=policy_oid, accuracy=accuracy,
     )
     thread = threading.Thread(
         target=server.serve_forever,
@@ -443,7 +609,8 @@ def start_tsa_server_background(
         daemon=True,
     )
     thread.start()
-    logger.info("TSA server started in background on http://%s:%d/tsa", host, port)
+    logger.info("TSA server started in background on http://%s:%d/tsa", host,
+                server.server_address[1])
     return server, thread
 
 
@@ -497,7 +664,14 @@ def ensure_tsa_server_running(
     ca_key_password: str | None = None,
     tsa_key_password: str | None = None,
 ) -> tuple[str, Path]:
-    """Ensure a local TSA server is running and return its URL and cert path."""
+    """Ensure a local TSA server is running and return its URL and cert path.
+
+    A server already started by this process for ``(host, port)`` is
+    reused. ``port=0`` means "any free port": a new server is started on
+    an ephemeral port on every call (never a reuse, since the credentials
+    of another call may differ), registered under the port actually
+    bound, and the returned URL names that port.
+    """
     resolved_tsa_password = _resolve_credential_password(
         tsa_key_password,
         env_name=_TSA_KEY_PASSWORD_ENV,
@@ -508,15 +682,14 @@ def ensure_tsa_server_running(
         ca_key_password=ca_key_password,
         tsa_key_password=resolved_tsa_password,
     )
-    server_key = (host, port)
 
     with _SERVER_LOCK:
-        running = _RUNNING_SERVERS.get(server_key)
+        running = _RUNNING_SERVERS.get((host, port)) if port else None
         if running is not None:
             server, thread = running
             if thread.is_alive():
                 return f"http://{host}:{port}/tsa", cert_path
-            _RUNNING_SERVERS.pop(server_key, None)
+            _RUNNING_SERVERS.pop((host, port), None)
 
         server, thread = start_tsa_server_background(
             tsa_key_path=key_path,
@@ -525,6 +698,7 @@ def ensure_tsa_server_running(
             host=host,
             port=port,
         )
-        _RUNNING_SERVERS[server_key] = (server, thread)
+        bound_port = int(server.server_address[1])
+        _RUNNING_SERVERS[(host, bound_port)] = (server, thread)
 
-    return f"http://{host}:{port}/tsa", cert_path
+    return f"http://{host}:{bound_port}/tsa", cert_path

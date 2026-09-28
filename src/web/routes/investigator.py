@@ -3,20 +3,24 @@
 Endpoints
 ---------
 POST /investigator/register-case  -- 사건 등록
-POST /investigator/upload-share   -- 키 조각 2 업로드
-POST /investigator/recover-key    -- SSS 키 복원
+POST /investigator/upload-share   -- 키 조각 2 업로드 (관리자 비상 복구용)
+POST /investigator/recover-key    -- SSS 키 복원 (표준 경로 s1+입력한 s2)
+POST /investigator/recover-key-timelock -- 시간 잠금 해제 (입력한 s2+s3, TSA 검증)
 GET  /investigator/download-key/<seal_id> -- .key 파일 다운로드
 GET  /investigator/recovered/<seal_id>    -- 복원 키 표시 페이지
+
+Both recovery routes decide through the single release gate
+(:mod:`web.release_gate`), which also writes the release audit trail.
+Both take the investigator share s2 from the form: this reference app has
+no investigator accounts, so holding the share is the credential, and a
+share uploaded to slot 2 is used only by the admin emergency path.
 """
 
 from __future__ import annotations
 
-import hashlib
 import io
-import json
 import logging
-from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from flask import (
     Blueprint,
@@ -30,16 +34,19 @@ from flask import (
     url_for,
 )
 
-from ..auth.auth_chain import normalize_birth_date
+from ..auth.case_passwords import check_case_password_policy, hash_case_password
+from ..auth.kdf_slots import DerivationBusy
+from ..auth.passwords import PasswordPolicyError
 from ..models.db_models import (
+    count_recent_auth_failures,
+    delete_auth_failure,
     find_case_by_seal_id,
-    find_key_shares_by_seal_id,
-    find_latest_key_commitment,
-    find_latest_seal_mode,
-    find_latest_unlock_time,
-    insert_case,
     insert_key_share,
+    record_auth_failure,
 )
+from ..privacy.case_identity import CaseRegistration, register_protected_case
+from ..privacy.keys import PrivacyUnavailable, privacy_keys_configured
+from .release_messages import denial_response
 
 logger = logging.getLogger(__name__)
 
@@ -50,78 +57,196 @@ bp = Blueprint(
     template_folder="../templates/investigator",
 )
 
+_MSG_PRIVACY_KEYS_MISSING = (
+    "개인정보 보호 키가 설정되지 않았거나 쓸 수 없어 사건을 등록할 수 "
+    "없습니다. 관리자에게 문의해 주세요."
+)
+_MSG_REGISTRATION_BUDGET = (
+    "이 주소에서 비밀번호를 쓰는 사건 등록이 많아 {minutes}분 동안 더 받지 "
+    "않습니다. 잠시 후 다시 시도해 주세요."
+)
+_MSG_BUSY = (
+    "서버에서 처리 중인 요청이 많아 지금은 사건을 등록하지 못했습니다. "
+    "잠시 후 다시 시도해 주세요."
+)
+# Budget rows of registrations that hash a case password, in auth_failures
+# (per client address), like E4's admin login budget. Seal IDs may not
+# start with '@', so no case can share these counters.
+_REGISTRATION_KEY = "@case-registration"
+_RESERVED_PREFIX = "@"
+# The levels the registration form offers; each includes the basic check.
+_AUTH_LEVELS = ("basic", "basic+password", "basic+otp", "basic+password+otp")
+_FORM_FIELDS = (
+    "seal_id", "case_number", "investigator", "suspect_name", "suspect_email",
+    "suspect_birth", "suspect_phone", "auth_level",
+)
+_REQUIRED_FIELDS = (
+    ("seal_id", "봉인 ID를 입력해 주세요."),
+    ("case_number", "사건번호를 입력해 주세요."),
+    ("investigator", "수사관 이름을 입력해 주세요."),
+    ("suspect_name", "피압수자 이름을 입력해 주세요."),
+)
+# The v1.0.1 MariaDB column sizes, checked before any write: the identity
+# columns now hold '', and the seal ID is also the associated data of the
+# ciphertexts, so MariaDB must never store it truncated.
+_FIELD_LIMITS = (
+    ("seal_id", 64, "봉인 ID"),
+    ("case_number", 128, "사건번호"),
+    ("investigator", 128, "수사관 이름"),
+    ("suspect_name", 128, "피압수자 이름"),
+    ("suspect_email", 256, "이메일"),
+    ("suspect_birth", 16, "생년월일"),
+    ("suspect_phone", 32, "연락처"),
+)
+
 
 # ---------------------------------------------------------------------------
 # POST /investigator/register-case
 # ---------------------------------------------------------------------------
 @bp.route("/register-case", methods=["GET", "POST"])
 def register_case() -> Any:
-    """Register a new case (사건 등록)."""
+    """Register a new case (사건 등록); the subject's identity is protected.
+
+    Stage E (E3a): the name, birth date and phone are stored as keyed
+    digests and the name and e-mail as ciphertexts under a new per-seal
+    data key (:mod:`web.privacy.case_identity`); no plaintext identity is
+    written. Without the identity-protection keys the route answers 503.
+    The authentication level must be one of the four the form offers (all
+    include the basic identity check). A password is required, and kept as
+    a scrypt hash, only for a level that uses it; it needs 12 to 1024
+    characters. Fields keep the length limits of the v1.0.1 MariaDB
+    columns (seal ID 64, case number and investigator 128, name 128,
+    e-mail 256, birth date 16, phone 32).
+
+    The route is unauthenticated, and hashing a password costs one scrypt
+    derivation (about 32 MiB): such a registration first reserves a place
+    in its client address's budget (429 beyond it), then needs a free slot
+    of the case-password pool (503, with its reservation withdrawn,
+    otherwise); neither refusal derives anything.
+    """
+    page = "register_case.html"
     if request.method == "GET":
-        return render_template("register_case.html")
+        return render_template(page)
+    if not privacy_keys_configured():
+        flash(_MSG_PRIVACY_KEYS_MISSING, "danger")
+        return render_template(page), 503
 
-    seal_id = (request.form.get("seal_id") or "").strip()
-    case_number = (request.form.get("case_number") or "").strip()
-    investigator_name = (request.form.get("investigator") or "").strip()
-    suspect_name = (request.form.get("suspect_name") or "").strip()
-    suspect_email = (request.form.get("suspect_email") or "").strip()
-    # Canonicalize birth date (accepts '1990-01-01' and '19900101' forms)
-    suspect_birth = normalize_birth_date(
-        (request.form.get("suspect_birth") or "").strip()
-    )
-    suspect_phone = (request.form.get("suspect_phone") or "").strip()
-    auth_level = (request.form.get("auth_level") or "basic").strip()
-    password_raw = request.form.get("password") or ""
-
-    # --- validation ---
-    errors: list[str] = []
-    if not seal_id:
-        errors.append("봉인 ID를 입력해 주세요.")
-    if not case_number:
-        errors.append("사건번호를 입력해 주세요.")
-    if not investigator_name:
-        errors.append("수사관 이름을 입력해 주세요.")
-    if not suspect_name:
-        errors.append("피압수자 이름을 입력해 주세요.")
-
-    if "password" in auth_level and not password_raw:
-        errors.append("비밀번호 인증을 사용하려면 비밀번호를 입력해 주세요.")
-
+    form = _registration_form()
+    errors = _registration_errors(form)
     if errors:
-        for e in errors:
-            flash(e, "danger")
-        return render_template("register_case.html"), 400
-
-    # Hash the password if provided
-    password_hash = ""
-    if password_raw:
-        password_hash = hashlib.sha256(password_raw.encode("utf-8")).hexdigest()
-
-    # Check for duplicate
-    existing = find_case_by_seal_id(seal_id)
-    if existing:
+        for error in errors:
+            flash(error, "danger")
+        return render_template(page), 400
+    if find_case_by_seal_id(form["seal_id"]):
         flash("이미 등록된 봉인 ID입니다.", "warning")
-        return render_template("register_case.html"), 409
+        return render_template(page), 409
+    reservation = None
+    if _uses_factor(form["auth_level"], "password"):
+        reservation = _reserve_registration()
+        if reservation is None:
+            window = current_app.config.get("CASE_REGISTRATION_WINDOW_SECONDS", 600)
+            flash(_MSG_REGISTRATION_BUDGET.format(minutes=window // 60), "danger")
+            return render_template(page), 429
+    return _store_registration(page, form, reservation)
 
+
+def _store_registration(page: str, form: dict[str, str], reservation: Optional[int]) -> Any:
+    """Hash the password (if any), store the protected case, answer."""
     try:
-        insert_case(
-            seal_id=seal_id,
-            case_number=case_number,
-            investigator=investigator_name,
-            suspect_name=suspect_name,
-            suspect_email=suspect_email,
-            suspect_birth=suspect_birth,
-            suspect_phone=suspect_phone,
-            auth_level=auth_level,
-            password_hash=password_hash,
-        )
+        register_protected_case(_case_registration(form))
+    except DerivationBusy:
+        if reservation is not None:
+            delete_auth_failure(reservation)  # refused before any password work
+        logger.warning("Case registration refused: case-password checks at capacity")
+        flash(_MSG_BUSY, "danger")
+        return render_template(page), 503, {"Retry-After": "1"}
+    except PrivacyUnavailable:
+        flash(_MSG_PRIVACY_KEYS_MISSING, "danger")
+        return render_template(page), 503
     except Exception:
         logger.exception("사건 등록 실패")
         flash("사건 등록 중 오류가 발생했습니다.", "danger")
-        return render_template("register_case.html"), 500
+        return render_template(page), 500
 
     flash("사건이 등록되었습니다.", "success")
     return redirect(url_for("investigator.register_case"))
+
+
+def _reserve_registration() -> Optional[int]:
+    """Reserve a place in the client address's registration budget.
+
+    Only registrations that hash a case password are budgeted. The row (in
+    ``auth_failures`` under a reserved key, as E4's login budget) is
+    committed first and counted afterwards, so simultaneous requests cannot
+    all see a count below the limit. It stays after a registration, which
+    is what it limits; it is withdrawn at once beyond the budget, and when
+    the request is refused as busy before any password work.
+
+    Returns:
+        The reservation's row id, or ``None`` when the budget is exhausted.
+    """
+    cfg = current_app.config
+    client_ip = request.remote_addr or "unknown"
+    row_id = record_auth_failure(_REGISTRATION_KEY, client_ip)
+    if row_id is None:
+        raise RuntimeError("auth_failures insert returned no row id")
+    used = count_recent_auth_failures(_REGISTRATION_KEY, client_ip,
+                                      cfg.get("CASE_REGISTRATION_WINDOW_SECONDS", 600))
+    if used <= cfg.get("CASE_REGISTRATION_MAX_PER_ADDRESS", 10):
+        return row_id
+    delete_auth_failure(row_id)
+    logger.warning("Case registration refused: address registration budget used up")
+    return None
+
+
+def _registration_form() -> dict[str, str]:
+    """The submitted registration fields, stripped (the password as given)."""
+    form = {name: (request.form.get(name) or "").strip() for name in _FORM_FIELDS}
+    form["auth_level"] = form["auth_level"] or "basic"
+    form["password"] = request.form.get("password") or ""
+    return form
+
+
+def _registration_errors(form: dict[str, str]) -> list[str]:
+    """User-facing validation messages (Korean); empty when valid."""
+    errors = [message for name, message in _REQUIRED_FIELDS if not form[name]]
+    errors += [f"{label}은(는) {limit}자 이하로 입력해 주세요."
+               for name, limit, label in _FIELD_LIMITS if len(form[name]) > limit]
+    if form["seal_id"].startswith(_RESERVED_PREFIX):
+        # '@'-keys in auth_failures count admin logins and registrations.
+        errors.append("봉인 ID는 '@'로 시작할 수 없습니다.")
+    if form["auth_level"] not in _AUTH_LEVELS:
+        errors.append("인증 수준이 올바르지 않습니다.")
+    elif _uses_factor(form["auth_level"], "password"):
+        errors += _password_errors(form["password"])
+    return errors
+
+
+def _uses_factor(auth_level: str, factor: str) -> bool:
+    return factor in auth_level.split("+")
+
+
+def _password_errors(password: str) -> list[str]:
+    if not password:
+        return ["비밀번호 인증을 사용하려면 비밀번호를 입력해 주세요."]
+    try:
+        check_case_password_policy(password)
+    except PasswordPolicyError as exc:
+        return [str(exc)]
+    return []
+
+
+def _case_registration(form: dict[str, str]) -> CaseRegistration:
+    """The registration; a password is hashed only for a level that uses it."""
+    stored_hash = (hash_case_password(form["password"])
+                   if _uses_factor(form["auth_level"], "password") else "")
+    return CaseRegistration(
+        seal_id=form["seal_id"], case_number=form["case_number"],
+        investigator=form["investigator"], name=form["suspect_name"],
+        email=form["suspect_email"], birth=form["suspect_birth"],
+        phone=form["suspect_phone"], auth_level=form["auth_level"],
+        password_hash=stored_hash,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +254,11 @@ def register_case() -> Any:
 # ---------------------------------------------------------------------------
 @bp.route("/upload-share", methods=["GET", "POST"])
 def upload_share() -> Any:
-    """Upload investigator key share (키 조각 2)."""
+    """Upload investigator key share (키 조각 2).
+
+    Neither investigator recovery route reads it (both take s2 from the
+    request); the admin emergency path may use it as its second share.
+    """
     if request.method == "GET":
         return render_template("upload_share.html")
 
@@ -166,7 +295,18 @@ def upload_share() -> Any:
 # ---------------------------------------------------------------------------
 @bp.route("/recover-key", methods=["GET", "POST"])
 def recover_key() -> Any:
-    """Recover AES key from uploaded shares via SSS."""
+    """Recover the AES key from the owner's s1 and the entered s2 (standard).
+
+    The requester must enter the investigator share (s2): knowing the seal
+    ID and waiting for the unlock time is not enough. Decided by
+    :func:`web.release_gate.release_standard`: the server-side unlock-time
+    gate and the key-commitment check of v1.0.1, with the values taken
+    from the authenticated policy when the synced record carries one. A
+    record without a key commitment is refused, because the entered share
+    could not be verified. This path deliberately makes no TSA round trip,
+    so a TSA outage does not block standard recovery. The entered share is
+    never logged or audited.
+    """
     if request.method == "GET":
         return render_template("recover_key.html")
 
@@ -175,150 +315,53 @@ def recover_key() -> Any:
         flash("봉인 ID를 입력해 주세요.", "danger")
         return render_template("recover_key.html"), 400
 
-    shares_rows = find_key_shares_by_seal_id(seal_id)
-    if len(shares_rows) < 2:
-        flash(
-            f"키 조각이 부족합니다. 현재 {len(shares_rows)}개 / 최소 2개 필요",
-            "danger",
-        )
-        return render_template("recover_key.html"), 400
+    from ..release_gate import release_standard
 
-    # Extract share_data — handle both dict-like and tuple rows
-    share_strings: list[str] = []
-    for row in shares_rows:
-        if isinstance(row, dict):
-            share_strings.append(row["share_data"])
-        elif hasattr(row, "keys"):
-            # sqlite3.Row
-            share_strings.append(row["share_data"])
-        else:
-            # Tuple: share_data is index 3
-            share_strings.append(row[3])
-
-    # Server-side mode dispatch (no UI branch): the sealing record synced
-    # from the offline environment states the recovery regime. A present
-    # but unreadable/unrecognized record denies recovery (fail-closed);
-    # only the documented legacy case (no synced record at all) defaults
-    # to standard.
-    try:
-        seal_mode = find_latest_seal_mode(seal_id)
-    except ValueError:
-        logger.exception("seal_mode unresolvable for %s", seal_id)
-        flash(
-            "봉인 기록의 복구 방식(seal_mode)을 검증할 수 없어 복원을 "
-            "거부합니다.", "danger",
-        )
-        return render_template("recover_key.html"), 500
-
-    if seal_mode is None:
-        logger.warning(
-            "No synced sealing record for %s; applying legacy standard "
-            "mode", seal_id,
-        )
-        seal_mode = "standard"
-
-    # Unlock-time policy gate: a server-side comparison of the current
-    # time against the unlock time anchored at sealing. This is a policy
-    # check distinct from the cryptographic s3 release verification and
-    # deliberately involves no TSA round trip, so a TSA outage does not
-    # block standard recovery. A present but unparseable unlock time
-    # denies recovery (fail-closed); records without the field (legacy)
-    # are ungated.
-    try:
-        unlock_iso = find_latest_unlock_time(seal_id)
-    except ValueError:
-        logger.exception("unlock_time unresolvable for %s", seal_id)
-        flash(
-            "봉인 기록의 열람 제한 시각(unlock_time)을 검증할 수 없어 "
-            "복원을 거부합니다.", "danger",
-        )
-        return render_template("recover_key.html"), 500
-
-    if unlock_iso is not None:
-        try:
-            # Records use the trailing-Z ISO form; accept the offset form
-            # too so legacy rows parse on any supported interpreter.
-            unlock_dt = datetime.fromisoformat(
-                unlock_iso.replace("Z", "+00:00")
-            )
-            if unlock_dt.tzinfo is None:
-                unlock_dt = unlock_dt.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            logger.error(
-                "Invalid unlock_time %r for %s", unlock_iso, seal_id,
-            )
-            flash(
-                "봉인 기록의 열람 제한 시각이 올바르지 않아 복원을 "
-                "거부합니다.", "danger",
-            )
-            return render_template("recover_key.html"), 500
-
-        if datetime.now(tz=timezone.utc) < unlock_dt:
-            flash(
-                "열람 제한 기간이 경과하지 않아 키 복원이 제한됩니다. "
-                f"(해제 시각: {unlock_dt.isoformat()})", "danger",
-            )
-            return render_template("recover_key.html"), 403
-
-    try:
-        import sys
-        import os
-
-        # Import the crypto module's recovery dispatch
-        crypto_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "desktop", "crypto")
-        )
-        if crypto_path not in sys.path:
-            sys.path.insert(0, os.path.dirname(crypto_path))
-
-        from desktop.crypto.sss_strict import (
-            SEAL_MODE_STRICT,
-            recover_key_for_mode,
-        )
-
-        if seal_mode == SEAL_MODE_STRICT:
-            recovered_hex = recover_key_for_mode(seal_mode, share_strings)
-        else:
-            recovered_hex = recover_key_for_mode(
-                seal_mode, share_strings[:2]
-            )
-    except Exception:
-        logger.exception("키 복원 실패")
-        flash("키 복원에 실패했습니다. 키 조각이 올바른지 확인해 주세요.", "danger")
-        return render_template("recover_key.html"), 500
-
-    # Verify the reconstruction against the signed commitment. Threshold
-    # recovery yields a plausible-looking key from wrong or corrupted
-    # shares, so without this check the portal would hand out a key that
-    # only fails much later, at unseal time.
-    try:
-        commitment = find_latest_key_commitment(seal_id)
-    except ValueError:
-        logger.exception("key_commitment unresolvable for %s", seal_id)
-        flash(
-            "봉인 기록의 복구키 확인값을 검증할 수 없어 복원을 거부합니다.",
-            "danger",
-        )
-        return render_template("recover_key.html"), 500
-
-    if commitment is None:
-        logger.warning(
-            "No key_commitment recorded for %s; reconstruction cannot be "
-            "verified (legacy record)", seal_id,
-        )
-    elif hashlib.sha256(
-        bytes.fromhex(recovered_hex)
-    ).hexdigest() != commitment:
-        logger.error("key_commitment mismatch for %s", seal_id)
-        flash(
-            "복원된 키가 봉인 기록의 확인값과 일치하지 않습니다. 키 조각을 "
-            "다시 확인해 주세요.", "danger",
-        )
-        return render_template("recover_key.html"), 400
+    decision = release_standard(seal_id, request.form.get("share_data") or "")
+    if not decision.allowed:
+        status, message = denial_response(decision)
+        flash(message, "danger")
+        return render_template("recover_key.html"), status
 
     # Store temporarily in session for download
-    session[f"recovered_key_{seal_id}"] = recovered_hex
+    session[f"recovered_key_{seal_id}"] = decision.key_hex
+    return redirect(url_for("investigator.recovered", seal_id=seal_id))
 
+
+# ---------------------------------------------------------------------------
+# POST /investigator/recover-key-timelock
+# ---------------------------------------------------------------------------
+@bp.route("/recover-key-timelock", methods=["GET", "POST"])
+def recover_key_timelock() -> Any:
+    """Time-locked release: the investigator's s2 plus the system share s3.
+
+    The requester must enter the investigator share (s2) in the form: this
+    reference app has no investigator accounts, so holding the share is
+    the credential. A share stored earlier in slot 2 plays no part in it.
+    Decided by :func:`web.release_gate.release_timelock` (fail-closed):
+    the synced record must carry a policy signed under a pinned CA, a
+    fresh TSA token bound to that policy must verify with a genTime not
+    before the unlock time, and only then is s3 unwrapped with the KMS
+    master key and recombined (strict mode also needs the owner share).
+    The entered share is never logged or audited.
+    """
+    if request.method == "GET":
+        return render_template("recover_key_timelock.html")
+
+    seal_id = (request.form.get("seal_id") or "").strip()
+    if not seal_id:
+        flash("봉인 ID를 입력해 주세요.", "danger")
+        return render_template("recover_key_timelock.html"), 400
+
+    from ..release_gate import release_timelock
+
+    decision = release_timelock(seal_id, request.form.get("share_data") or "")
+    if not decision.allowed:
+        status, message = denial_response(decision)
+        flash(message, "danger")
+        return render_template("recover_key_timelock.html"), status
+
+    session[f"recovered_key_{seal_id}"] = decision.key_hex
     return redirect(url_for("investigator.recovered", seal_id=seal_id))
 
 

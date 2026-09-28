@@ -4,11 +4,18 @@ Guides the investigator through the complete resealing workflow:
 R1 - Load previous unseal record JSON
 R2 - File comparison results (known / unknown files)
 R3 - Unknown file classification UI
-R4 - Reseal info input (investigator, reason, participation)
+R4 - Reseal info input (investigator, reason, participation, unlock days)
 R5 - Encryption progress
 R6 - Reseal record preview
-R7 - Key split results + unlock_time setting
+R7 - Key split results (unlock_time read from the R6 record)
 R8 - Completion summary
+
+The unlock days are chosen at R4 because R6 writes the unlock time into the
+record from that configuration; R7 splits the key without arguments.
+
+The R7 split and share handout, the R8 save and leaving the wizard while
+key material is held live in :mod:`desktop.gui.reseal_keys`
+(``ResealKeyStepsMixin``); this module keeps the step layouts.
 """
 
 from __future__ import annotations
@@ -17,11 +24,14 @@ import logging
 import threading
 import tkinter as tk
 from datetime import datetime, timedelta, timezone
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .i18n import t
 from .progress_dialog import run_async
+from .reseal_keys import ResealKeyStepsMixin
+from .seal_mode_view import MODE_STANDARD, describe_seal_mode, seal_mode_rows
+from .share_handout import ShareHandoutPanel, share_file_rows
 from .step_indicator import StepIndicator
 from .theme import FONTS, get_color, get_font
 from .widgets import (
@@ -47,9 +57,12 @@ MIN_CHUNK_GB = 1
 MAX_CHUNK_GB = 64
 # 1 GiB default — matches the sealing wizard and the paper's recommendation.
 DEFAULT_CHUNK_GB = 1
+# Input widgets disabled when a past step is reviewed after encryption.
+_INPUT_WIDGETS = (tk.Entry, tk.Spinbox, tk.Button, tk.Checkbutton, tk.Radiobutton,
+                  ttk.Entry, ttk.Button, ttk.Checkbutton, ttk.Radiobutton)
 
 
-class ResealWizard(tk.Frame):
+class ResealWizard(ResealKeyStepsMixin, tk.Frame):
     """Multi-step wizard for the resealing process.
 
     Each step is built as a separate frame.  Navigation buttons
@@ -66,13 +79,21 @@ class ResealWizard(tk.Frame):
         on_complete: Optional[Callable[[dict[str, Any]], None]] = None,
         on_cancel: Optional[Callable[[], None]] = None,
         prefill_data: Optional[dict[str, Any]] = None,
+        ask_share_path: Optional[Callable[..., Any]] = None,
     ) -> None:
         super().__init__(master)
         self._app = app
         self._on_complete = on_complete
         self._on_cancel = on_cancel
         self._prefill_data = prefill_data
+        # The save dialog of the R7 share handout (None: the Tk dialog).
+        self._ask_share_path = ask_share_path
+        # Fingerprints of the four new shares; shares 1 and 2 themselves live
+        # only in the R7 handout panel until completion.
+        self._share_prints: tuple[str, ...] = ()
         self._current_step = 0
+        # While a past step is reviewed read-only: the step to return to.
+        self._review_return: Optional[int] = None
         self._data: dict[str, Any] = {}
         self._busy = False
         self._r2_running = False
@@ -211,7 +232,8 @@ class ResealWizard(tk.Frame):
         if event.widget is not self:
             return
         self._async_cancel.set()
-        self._cleanup_partial_encryption()
+        self._cleanup_partial_encryption()  # reads the process: first
+        self._release_key_material()  # however the wizard is left
         try:
             top = self._bound_toplevel
             if top.winfo_exists():
@@ -270,6 +292,12 @@ class ResealWizard(tk.Frame):
         except tk.TclError:
             pass
 
+    def is_busy(self) -> bool:
+        """True while work runs that must not be left: R2, the R5 encryption
+        dialog (the window's X reaches the main window through its grab),
+        the R6 record and the R8 save."""
+        return self._busy
+
     def _set_busy(self, busy: bool, message: str = "") -> None:
         """Toggle a background-work state: nav disabled + status message."""
         self._busy = busy
@@ -325,8 +353,8 @@ class ResealWizard(tk.Frame):
         pdf_path = pf.get("pdf_path", "")
         seal_id = pf.get("seal_id", "")
         if pdf_path and seal_id and hasattr(self, "_prev_record_selector"):
-            # The unseal record JSON is typically at:
-            # <dir>/<seal_id>_record.json
+            # The record of the stored record's last event, beside its PDF
+            # (get_case_for_unseal), e.g. <dir>/<seal_id>_unseal_record.json
             record_json_path = pf.get("record_json_path", "")
             if record_json_path:
                 self._prev_record_selector.set(record_json_path)
@@ -441,11 +469,16 @@ class ResealWizard(tk.Frame):
             self._data["_process"] = process
             self._data["prev_record"] = result["prev_record"]
             self._data["seal_id"] = result["seal_id"]
+            # The mode is kept: R7 splits the new key under the same regime.
+            self._data["seal_mode"] = result.get("seal_mode", MODE_STANDARD)
             self._data["target_dir"] = self._target_dir_selector.get()
             self._data["output_dir"] = self._output_dir_selector.get()
 
             # Show loaded info
-            self._show_r1_info(result["prev_record"])
+            self._show_r1_info(
+                result["prev_record"],
+                confirmed=result.get("mode_source") is not None,
+            )
             return True
 
         except Exception as exc:
@@ -454,17 +487,28 @@ class ResealWizard(tk.Frame):
             )
             return False
 
-    def _show_r1_info(self, record: dict[str, Any]) -> None:
-        """Display loaded record summary."""
+    def _show_r1_info(self, record: dict[str, Any], *, confirmed: bool = True) -> None:
+        """Display loaded record summary, with the mode the reseal keeps.
+
+        ``confirmed`` is False when neither a signed policy nor a record
+        stored on this PC backs the mode: a warning line is added.
+        """
         self._r1_info.configure(state="normal")
         self._r1_info.delete("1.0", "end")
+        mode_view = describe_seal_mode(record)
         lines = [
             f"  Seal ID: {record.get('seal_id', 'N/A')}",
             t("reseal.record_info_type").format(v=record.get('type', 'N/A')),
             t("reseal.record_info_case").format(v=record.get('case_number', 'N/A')),
             t("reseal.record_info_created").format(v=record.get('created_at', 'N/A')),
             f"  Summary: {record.get('summary', 'N/A')}",
+            t("reseal.record_info_mode").format(
+                v=t("mode.kept").format(v=mode_view.label)
+            ),
+            t("keysplit.recovery").format(v=mode_view.shares),
         ]
+        if not confirmed:
+            lines.append(t("reseal.mode_unverified"))
         self._r1_info.insert("1.0", "\n".join(lines))
         self._r1_info.configure(state="disabled")
 
@@ -852,6 +896,26 @@ class ResealWizard(tk.Frame):
             side="left", padx=8
         )
 
+        # Unlock days: R6 writes the unlock time into the record from this value.
+        unlock_frame = tk.Frame(parent)
+        unlock_frame.pack(fill="x", pady=8)
+        tk.Label(
+            unlock_frame, text=t("seal.unlock_label"), anchor="w", width=20
+        ).pack(side="left")
+        self._r4_unlock_days_var = tk.IntVar(value=DEFAULT_UNLOCK_DAYS)
+        self._r4_unlock_spin = tk.Spinbox(
+            unlock_frame,
+            from_=MIN_UNLOCK_DAYS,
+            to=MAX_UNLOCK_DAYS,
+            textvariable=self._r4_unlock_days_var,
+            width=6,
+        )
+        self._r4_unlock_spin.pack(side="left")
+        tk.Label(
+            unlock_frame,
+            text=t("reseal.unlock_days").format(min=MIN_UNLOCK_DAYS, max=MAX_UNLOCK_DAYS),
+        ).pack(side="left", padx=8)
+
         self._validators.append(self._validate_r4)
 
     def _validate_r4(self) -> bool:
@@ -886,8 +950,22 @@ class ResealWizard(tk.Frame):
             if focus_target is None:
                 self._r4_chunk_spin.focus_set()
 
+        unlock_msg = t("validate.unlock_range").format(
+            min=MIN_UNLOCK_DAYS, max=MAX_UNLOCK_DAYS
+        )
+        try:
+            if MIN_UNLOCK_DAYS <= self._r4_unlock_days_var.get() <= MAX_UNLOCK_DAYS:
+                unlock_msg = ""
+        except (tk.TclError, ValueError):
+            pass
+        if unlock_msg:
+            error_count += 1
+            if focus_target is None and not chunk_msg:
+                self._r4_unlock_spin.focus_set()
+
         if error_count:
-            summary = chunk_msg if (chunk_msg and error_count == 1) else t(
+            spin_msgs = [m for m in (chunk_msg, unlock_msg) if m]
+            summary = spin_msgs[0] if (spin_msgs and error_count == 1) else t(
                 "validate.fix_errors"
             ).format(count=error_count)
             self._set_nav_message(summary)
@@ -900,6 +978,7 @@ class ResealWizard(tk.Frame):
         self._data["reason"] = self._r4_reason.get()
         self._data["subject_participated"] = self._r4_participation_var.get()
         self._data["chunk_size_gb"] = self._r4_chunk_var.get()
+        self._data["unlock_days"] = self._r4_unlock_days_var.get()
 
         # Set process config
         process = self._data.get("_process")
@@ -914,7 +993,7 @@ class ResealWizard(tk.Frame):
                     investigator=self._data["investigator"],
                     reason=self._data["reason"],
                     subject_participated=self._data["subject_participated"],
-                    unlock_days=self._data.get("unlock_days", 10),
+                    unlock_days=self._data["unlock_days"],
                 )
                 process.set_config(config)
             except Exception as exc:
@@ -991,7 +1070,10 @@ class ResealWizard(tk.Frame):
         def on_complete(result):  # type: ignore[no-untyped-def]
             enc_count = len(result.get("enc_results", []))
             self._update_r5_status(t("reseal.enc_complete").format(v=enc_count))
-            self._data["encrypt_result"] = result
+            # The new AES key stays in the process, never in the wizard data.
+            self._data["encrypt_result"] = {
+                k: v for k, v in result.items() if k != "aes_key_hex"
+            }
             self._data["encrypt_done"] = True
             self._r5_progress_label.configure(text=t("progress.encrypt_complete"))
 
@@ -1008,18 +1090,21 @@ class ResealWizard(tk.Frame):
             self._update_r5_status(t("unseal.error_occurred").format(v=exc))
             self._r5_progress_label.configure(text=t("unseal.error_occurred").format(v=exc))
 
-        dlg = ProgressDialog(
-            self.winfo_toplevel(),
-            title=t("process.reseal_encrypt_title"),
-            task_fn=task_fn,
-            on_complete=on_complete,
-            on_error=on_error,
-        )
-        self._active_dialog = dlg
+        # Busy while the dialog runs: its grab does not stop the window's X.
+        self._set_busy(True, t("process.reseal_encrypt_title"))
         try:
+            dlg = ProgressDialog(
+                self.winfo_toplevel(),
+                title=t("process.reseal_encrypt_title"),
+                task_fn=task_fn,
+                on_complete=on_complete,
+                on_error=on_error,
+            )
+            self._active_dialog = dlg
             self.winfo_toplevel().wait_window(dlg)
         finally:
             self._active_dialog = None
+            self._set_busy(False)
 
         # Record (PDF) generation runs on a worker thread AFTER the
         # progress dialog closes — no main-thread freeze at 100%.
@@ -1164,6 +1249,7 @@ class ResealWizard(tk.Frame):
                 "rows": [
                     (t("summary.seal_id"), seal_id),
                     (t("summary.case_number"), extract_case_number(record)),
+                    *seal_mode_rows(record, kept=True),
                 ],
             },
             {
@@ -1192,7 +1278,7 @@ class ResealWizard(tk.Frame):
         ]
         self._r6_summary.render(sections)
 
-    # --- R7: Key split results + unlock_time -----------------------------
+    # --- R7: Key split results (unlock_time from the R6 record) ----------
 
     def _build_r7(self, parent: tk.Frame) -> None:
         tk.Label(
@@ -1215,90 +1301,16 @@ class ResealWizard(tk.Frame):
         )
         self._r7_result.pack(fill="both", expand=True, pady=4)
 
-        unlock_frame = tk.Frame(parent)
-        unlock_frame.pack(fill="x", pady=8)
-        tk.Label(
-            unlock_frame, text=t("seal.unlock_label"), anchor="w", width=20
-        ).pack(side="left")
-        self._r7_unlock_days_var = tk.IntVar(value=DEFAULT_UNLOCK_DAYS)
-        self._r7_unlock_spin = tk.Spinbox(
-            unlock_frame,
-            from_=MIN_UNLOCK_DAYS,
-            to=MAX_UNLOCK_DAYS,
-            textvariable=self._r7_unlock_days_var,
-            width=6,
-        )
-        self._r7_unlock_spin.pack(side="left")
-        tk.Label(
-            unlock_frame, text=t("reseal.unlock_days").format(min=MIN_UNLOCK_DAYS, max=MAX_UNLOCK_DAYS)
-        ).pack(side="left", padx=8)
-
         self._r7_status_label = tk.Label(parent, text="", anchor="w")
         self._r7_status_label.pack(fill="x", pady=4)
 
+        # The new shares 1 and 2 are handed out here, as two .share files.
+        self._handout_panel = ShareHandoutPanel(
+            parent, ask_save_path=self._ask_share_path
+        )
+        self._handout_panel.pack(fill="x", pady=(4, 0))
+
         self._validators.append(self._validate_r7)
-
-    def _validate_r7(self) -> bool:
-        try:
-            days = self._r7_unlock_days_var.get()
-            if not (MIN_UNLOCK_DAYS <= days <= MAX_UNLOCK_DAYS):
-                raise ValueError
-        except (tk.TclError, ValueError):
-            self._set_nav_message(
-                t("validate.unlock_range").format(
-                    min=MIN_UNLOCK_DAYS, max=MAX_UNLOCK_DAYS
-                )
-            )
-            self._r7_unlock_spin.focus_set()
-            return False
-
-        self._set_nav_message("")
-        self._data["unlock_days"] = days
-
-        # Run key split
-        process = self._data.get("_process")
-        if process is not None:
-            try:
-                result = process.run_r7_split_key(unlock_days=days)
-                self._data["key_shares"] = result["shares"]
-                self._data["unlock_time_iso"] = result["unlock_time_iso"]
-                self._refresh_r7_result()
-            except Exception as exc:
-                messagebox.showerror(
-                    t("keysplit.error"), str(exc), parent=self.winfo_toplevel()
-                )
-                return False
-
-        return True
-
-    def _refresh_r7_result(self) -> None:
-        """Display key split results."""
-        self._r7_result.configure(state="normal")
-        self._r7_result.delete("1.0", "end")
-
-        shares = self._data.get("key_shares")
-        unlock_time = self._data.get("unlock_time_iso", "N/A")
-
-        if shares and len(shares) == 4:
-            lines = [
-                t("keysplit.complete_title"),
-                "",
-                t("keysplit.share_subject").format(v=shares[0][:16]),
-                t("keysplit.share_investigator").format(v=shares[1][:16]),
-                t("keysplit.share_system").format(v=shares[2][:16]),
-                t("keysplit.share_admin").format(v=shares[3][:16]),
-                "",
-                f"  unlock_time: {unlock_time}",
-                "",
-                t("keysplit.subject_store"),
-                t("keysplit.investigator_store"),
-                t("keysplit.system_store"),
-            ]
-        else:
-            lines = [t("keysplit.run_prompt")]
-
-        self._r7_result.insert("1.0", "\n".join(lines))
-        self._r7_result.configure(state="disabled")
 
     # --- R8: Completion summary ------------------------------------------
 
@@ -1316,12 +1328,8 @@ class ResealWizard(tk.Frame):
 
         self._validators.append(self._validate_r8)
 
-    def _validate_r8(self) -> bool:
-        """Final step -- always valid."""
-        return True
-
     def _refresh_r8_summary(self) -> None:
-        """Populate the final summary cards and save to DB."""
+        """Populate the final summary cards (the badge follows the save)."""
         seal_id = self._data.get("seal_id", "N/A")
         record_result = self._data.get("record_result", {})
         encrypt_result = self._data.get("encrypt_result", {})
@@ -1336,12 +1344,14 @@ class ResealWizard(tk.Frame):
         for er in enc_results:
             enc_rows.append(("", er.get("enc_filepath", "")))
 
+        saved = bool(self._data.get("reseal_saved"))
         sections = [
             {
                 "title": t("complete.reseal_title").strip(),
-                "badge": (t("common.complete"), "success"),
+                "badge": self._r8_badge(saved),
                 "rows": [
                     (t("summary.seal_id"), seal_id),
+                    *share_file_rows(self._handout_panel.saved()),
                 ],
             },
             {
@@ -1354,40 +1364,22 @@ class ResealWizard(tk.Frame):
                     (t("summary.record_json"), record_result.get("record_json_path", "N/A")),
                     (t("summary.record_pdf"), record_result.get("pdf_path", "N/A")),
                     (t("summary.unlock_time"), self._data.get("unlock_time_iso", "N/A")),
+                    *seal_mode_rows(record_result.get("record_dict"), kept=True),
                 ],
             },
             {
                 "title": t("summary.notice"),
+                # The "saved" notice only once the reseal is saved.
                 "rows": [
                     ("", t("complete.reseal_saved").strip()),
                     ("", "\n".join(
                         line.strip()
                         for line in t("complete.reseal_key_instruction").splitlines()
                     ).strip()),
-                ],
+                ] if saved else [("", t("reseal.saving").strip())],
             },
         ]
         self._r8_summary.render(sections)
-
-        # Save to DB (R8)
-        self._run_r8_save()
-
-    def _run_r8_save(self) -> None:
-        """Run R8 save in background."""
-        process = self._data.get("_process")
-        if process is None:
-            return
-
-        def _save() -> None:
-            try:
-                result = process.run_r8_save()
-                self._data["reseal_result"] = result
-                logger.info("R8 저장 완료: %s", result.seal_id)
-            except Exception as exc:
-                logger.warning("R8 저장 오류: %s", exc)
-
-        thread = threading.Thread(target=_save, daemon=True)
-        thread.start()
 
     # ------------------------------------------------------------------
     # Navigation
@@ -1438,33 +1430,54 @@ class ResealWizard(tk.Frame):
             self._refresh_r7_result()
         elif index == 7:
             self._refresh_r8_summary()
+            self._ensure_r8_saved()
 
     def _on_step_click(self, step_index: int) -> None:
         """Handle step indicator click to navigate or view past steps."""
         if self._busy:
             return
-        current = self._current_step
-        if step_index > current:
-            return
-        if step_index == current:
+        actual = self._current_step if self._review_return is None else self._review_return
+        if step_index > actual or step_index == self._current_step:
             return
         if self._data.get("encrypt_done") and step_index < 4:
             self._show_step_readonly(step_index)
             return
+        if self._review_return is not None:
+            self._return_to_actual(step_index)
+            return
         self._show_step(step_index)
 
     def _show_step_readonly(self, index: int) -> None:
-        """Show a past step in read-only mode with a 'back to current' button."""
-        actual_step = self._current_step
+        """Show a past step in read-only mode with a 'back to current' button.
+
+        The step to return to is kept across nested review visits, and the
+        reviewed step's inputs are disabled: after encryption, R1-R4 values can
+        no longer take effect (R6 writes the record from them).
+        """
+        if self._review_return is None:
+            self._review_return = self._current_step
+        actual_step = self._review_return
         self._show_step(index)
+        self._disable_inputs(self._steps[index])
         self._next_btn.configure(
             text=t("common.back_to_current"),
             command=lambda: self._return_to_actual(actual_step),
         )
         self._prev_btn.configure(state="disabled")
 
+    def _disable_inputs(self, widget: tk.Misc) -> None:
+        """Disable every input widget below ``widget``."""
+        for child in widget.winfo_children():
+            if isinstance(child, _INPUT_WIDGETS):
+                try:
+                    child.configure(state="disabled")
+                except tk.TclError:
+                    pass
+            self._disable_inputs(child)
+
     def _return_to_actual(self, actual_step: int) -> None:
         """Return to the actual current step from readonly view."""
+        self._review_return = None
         self._next_btn.configure(
             text=t("common.next"),
             command=self._go_next,
@@ -1492,14 +1505,20 @@ class ResealWizard(tk.Frame):
         """Advance to the next step after validation."""
         if self._busy:
             return
+        if self._review_return is not None:
+            # Reviewing a past step (also reached by the Return key): go back,
+            # never validate the reviewed step.
+            self._return_to_actual(self._review_return)
+            return
         idx = self._current_step
         validator = self._validators[idx]
         if not validator():
             return
 
         if idx == self.TOTAL_STEPS - 1:
+            completion = self._release_key_material()
             if self._on_complete is not None:
-                self._on_complete(self._data)
+                self._on_complete(completion)
             return
 
         self._show_step(idx + 1)
@@ -1510,16 +1529,6 @@ class ResealWizard(tk.Frame):
             return
         if self._current_step > 0:
             self._show_step(self._current_step - 1)
-
-    def _handle_cancel(self) -> None:
-        """Confirm cancellation with the user."""
-        if messagebox.askyesno(
-            t("cancel.title"),
-            t("reseal.cancel_confirm"),
-            parent=self.winfo_toplevel(),
-        ):
-            if self._on_cancel is not None:
-                self._on_cancel()
 
     # ------------------------------------------------------------------
     # Public API

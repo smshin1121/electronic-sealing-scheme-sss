@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}시간 잠금 해제 - 수사관{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h3 class="mb-4">시간 잠금 해제 (키 조각 2 + 3)</h3>
+        <p class="text-muted">
+            열람 해제 시각이 지난 봉인에 대해, 여기에 입력한 수사관 키 조각(2)과
+            시스템 키 조각(3)으로 키를 복원합니다. 수사관 키 조각을 가진 사람만
+            요청할 수 있으며, 서버에 미리 올린 조각은 이 경로에서 쓰지 않습니다.
+            시스템 키 조각은 인증된 봉인 정책과 검증된 TSA 시각이 확인된 경우에만
+            풀리며, 모든 시도는 감사 기록에 남습니다(입력한 조각은 기록하지
+            않습니다). 엄격 모드 봉인은 피압수자 키 조각(1)도 필요합니다.
+        </p>
+
+        <form method="POST" action="{{ url_for('investigator.recover_key_timelock') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <div class="mb-3">
+                <label for="seal_id" class="form-label required">봉인 ID</label>
+                <input type="text" class="form-control" id="seal_id" name="seal_id"
+                       placeholder="S-20251104-ABA82E" required>
+            </div>
+
+            <div class="mb-3">
+                <label for="share_data" class="form-label required">수사관 키 조각 (2)</label>
+                <textarea class="form-control font-monospace" id="share_data"
+                          name="share_data" rows="2" autocomplete="off"
+                          spellcheck="false" placeholder="2-..." required></textarea>
+            </div>
+
+            <button type="submit" class="btn btn-warning">시간 잠금 해제</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

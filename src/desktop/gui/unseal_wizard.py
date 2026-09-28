@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .i18n import t
 from .progress_dialog import run_async
+from .seal_mode_view import seal_mode_rows
 from .step_indicator import StepIndicator
 from .theme import FONTS, get_color, get_font
 from .widgets import (
@@ -420,6 +421,19 @@ class UnsealWizard(tk.Frame):
         )
         self._key_error_label.pack(fill="x")
 
+        # The key is recovered elsewhere (release gate); which shares that
+        # needs depends on the record's mode, shown at U4.
+        self._key_hint_label = tk.Label(
+            parent,
+            text=t("unseal.key_hint"),
+            fg=get_color("text_secondary"),
+            font=get_font("small"),
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        )
+        self._key_hint_label.pack(fill="x", pady=(2, 0))
+
         # Unseal info
         tk.Label(
             parent,
@@ -631,6 +645,11 @@ class UnsealWizard(tk.Frame):
             self._data["mismatch_acknowledged"] = True
         return True
 
+    def _mode_rows(self) -> list[tuple]:
+        """Mode and recovery shares of the loaded record ([] before U3 loads one)."""
+        record = self._data.get("seal_record")
+        return seal_mode_rows(record) if record else []
+
     def _refresh_u4_results(self) -> None:
         """Populate the U4 verification result cards."""
         items = self._data.get("verification_items", [])
@@ -656,6 +675,7 @@ class UnsealWizard(tk.Frame):
             "rows": [
                 (t("summary.seal_id"), seal_id),
                 (t("summary.source_file"), self._data.get("enc_filepath", "")),
+                *self._mode_rows(),
             ],
         }
 
@@ -918,6 +938,7 @@ class UnsealWizard(tk.Frame):
                 "rows": [
                     (t("summary.seal_id"), seal_id),
                     (t("summary.case_number"), extract_case_number(record)),
+                    *self._mode_rows(),
                 ],
             },
             {
@@ -1006,6 +1027,7 @@ class UnsealWizard(tk.Frame):
                 "rows": [
                     (t("summary.seal_id"), seal_id),
                     (t("summary.dec_file"), decrypt.get("output_filepath", "N/A")),
+                    *self._mode_rows(),
                 ],
             },
             {
@@ -1057,21 +1079,25 @@ class UnsealWizard(tk.Frame):
         self._run_u7_save()
 
     def _run_u7_save(self) -> None:
-        """Run U7 save in background."""
+        """Run U7 save in background; a refused or failed save is shown."""
         process = self._data.get("_process")
         if process is None:
             return
 
-        def _save() -> None:
-            try:
-                result = process.run_u7_save()
-                self._data["unseal_result"] = result
-                logger.info("U7 저장 완료: %s", result.seal_id)
-            except Exception as exc:
-                logger.warning("U7 저장 오류: %s", exc)
+        def _saved(result: Any) -> None:
+            self._data["unseal_result"] = result
+            logger.info("U7 저장 완료: %s", result.seal_id)
 
-        thread = threading.Thread(target=_save, daemon=True)
-        thread.start()
+        def _failed(exc: Exception) -> None:
+            logger.warning("U7 저장 오류: %s", exc)
+            messagebox.showerror(
+                t("unseal.u7_save_failed_title"),
+                t("unseal.u7_save_failed_msg").format(error=exc),
+                parent=self.winfo_toplevel(),
+            )
+
+        run_async(self, process.run_u7_save, _saved, _failed,
+                  cancel_event=self._async_cancel)
 
     # ------------------------------------------------------------------
     # Navigation

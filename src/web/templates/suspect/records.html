@@ -5,6 +5,10 @@
     <div class="col-md-10">
         <h3 class="mb-4">봉인 기록지 열람</h3>
         <p class="text-muted">봉인 ID: <strong>{{ seal_id }}</strong></p>
+        <p class="text-muted small">
+            기록 내용과 기록지 PDF는 암호화해 보관하며, 열람하거나 내려받을 때마다
+            열람 사실(시각, 접속 주소)이 기록됩니다.
+        </p>
 
         {% if records %}
         <div class="table-responsive">
@@ -37,6 +41,12 @@
                                     onclick="showRecord({{ loop.index0 }}, {{ rec.event_id }})">
                                 기록지 보기
                             </button>
+                            {% if rec.has_pdf %}
+                            <a class="btn btn-sm btn-outline-primary"
+                               href="{{ url_for('suspect.record_pdf', seal_id=seal_id, event_id=rec.event_id) }}">
+                                PDF 내려받기
+                            </a>
+                            {% endif %}
                         </td>
                     </tr>
                     {% endfor %}

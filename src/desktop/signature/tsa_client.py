@@ -2,18 +2,38 @@
 
 Sends TimeStampReq (TSQ) to a TSA server and receives TimeStampResp (TSR).
 Supports retry with exponential backoff and TST token verification.
+
+Two verified requests exist. :func:`request_timestamp_verified` and
+:func:`request_timestamp_verified_token` check a token against one pinned
+TSA certificate (stage D; kept for the desktop component and backward
+compatibility). :func:`request_timestamp_trusted` accepts a token only
+under the pinned TSA trust profile of :mod:`.tsa_profile` (TSA CA chain,
+EKU, ESS, policy OID, accuracy; stage E, E2b) and is the one the
+time-locked release path uses.
 """
 
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import requests
 from asn1crypto import algos, cms, core, tsp
 
 from .exceptions import TSAError
+from .tsa_profile import (
+    TSA_CONFIG,
+    TSA_IMPRINT,
+    TSA_TRANSPORT,
+    TimeStampResponse,
+    TsaTrustProfile,
+    load_trust_profile,
+    verify_trusted_token,
+)
+from .types import VerifiedTimestamp
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +46,12 @@ _RETRY_BACKOFF_BASE = 1.0  # seconds
 _LOCAL_TIMEOUT_SECONDS = 2
 _LOCAL_MAX_RETRIES = 2
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# A TimeStampResp is a few kilobytes: the token and the TSA certificate,
+# perhaps its chain. A larger reply is refused, not read, with the same
+# 64 KiB bound as the desktop sync transport's answers
+# (desktop.sync.transport.MAX_ANSWER_BYTES).
+MAX_TSA_REPLY_BYTES = 64 * 1024
 
 
 def _is_local_tsa(tsa_url: str) -> bool:
@@ -90,22 +116,23 @@ def _parse_tsr(tsr_bytes: bytes) -> bytes:
     Raises:
         TSAError: If the TSR indicates failure or cannot be parsed.
     """
-    try:
-        tsr = tsp.TimeStampResp.load(tsr_bytes)
+    try:  # the RFC 3161 structure: a rejection carries no token
+        tsr = TimeStampResponse.load(tsr_bytes)
+        status_info = tsr["status"]
+        status = status_info["status"].native
+        fail_info = status_info["fail_info"].native
+        status_string = status_info["status_string"].native
+        tst_token = tsr["time_stamp_token"]
     except Exception as exc:
         raise TSAError(f"Failed to parse TSR: {exc}") from exc
 
-    status = tsr["status"]["status"].native
     if status != "granted" and status != "granted_with_mods":
-        fail_info = tsr["status"].get("fail_info")
-        status_string = tsr["status"].get("status_string")
         raise TSAError(
             f"TSA request rejected: status={status}, "
             f"fail_info={fail_info}, status_string={status_string}"
         )
 
-    tst_token = tsr["time_stamp_token"]
-    if tst_token.native is None:
+    if isinstance(tst_token, core.Void):
         raise TSAError("TSR contains no TimeStampToken")
 
     return tst_token.dump()
@@ -135,8 +162,41 @@ def request_timestamp(data_hash: bytes, tsa_url: str) -> bytes:
     return _send_tsq(tsq_bytes, tsa_url)
 
 
+def _redact_url(url: str) -> str:
+    """``url`` without userinfo, so credentials never reach logs or audit."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<unparsable TSA URL>"
+    return urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+
+
+def _failure_text(exc: Exception, tsa_url: str) -> str:
+    """Log and error text of a failed TSA request, without URL credentials.
+
+    requests renders the full URL, userinfo included, into ``HTTPError``
+    text; that case is rebuilt from the status code, and any other text
+    has the userinfo removed.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(exc, requests.HTTPError) and response is not None:
+        return f"HTTP {response.status_code} from {_redact_url(tsa_url)}"
+    text = str(exc).replace(tsa_url, _redact_url(tsa_url))
+    userinfo = tsa_url.partition("://")[2].partition("/")[0].rpartition("@")[0]
+    return text.replace(userinfo + "@", "") if userinfo else text
+
+
 def _send_tsq(tsq_bytes: bytes, tsa_url: str) -> bytes:
-    """POST a DER-encoded TSQ and return the extracted TST token."""
+    """POST a DER-encoded TSQ and return the extracted TST token.
+
+    A redirect is not followed, a content-coded reply is not accepted, and
+    the reply is read up to :data:`MAX_TSA_REPLY_BYTES`: each of these is
+    refused at once as ``tsa_transport``, without a retry (Fable gate,
+    finding 7). Network errors and HTTP 4xx/5xx answers are retried. Logs
+    and errors name the URL without its userinfo (credentials).
+    """
     if _is_local_tsa(tsa_url):
         timeout_seconds = _LOCAL_TIMEOUT_SECONDS
         max_retries = _LOCAL_MAX_RETRIES
@@ -144,41 +204,27 @@ def _send_tsq(tsq_bytes: bytes, tsa_url: str) -> bytes:
         timeout_seconds = _TIMEOUT_SECONDS
         max_retries = _MAX_RETRIES
 
-    last_error: Exception | None = None
+    last_error = ""
 
     for attempt in range(1, max_retries + 1):
         try:
             logger.info(
                 "TSA request attempt %d/%d to %s",
-                attempt, max_retries, tsa_url,
+                attempt, max_retries, _redact_url(tsa_url),
             )
-            response = requests.post(
-                tsa_url,
-                data=tsq_bytes,
-                headers={"Content-Type": "application/timestamp-query"},
-                timeout=timeout_seconds,
-            )
-            response.raise_for_status()
-
-            content_type = response.headers.get("Content-Type", "")
-            if "application/timestamp-reply" not in content_type:
-                logger.warning(
-                    "Unexpected Content-Type from TSA: %s", content_type
-                )
-
-            tst_token = _parse_tsr(response.content)
+            tst_token = _parse_tsr(_post_tsq(tsq_bytes, tsa_url, timeout_seconds))
             logger.info("TST token received successfully (attempt %d)", attempt)
             return tst_token
 
         except TSAError:
             raise
         except Exception as exc:
-            last_error = exc
+            last_error = _failure_text(exc, tsa_url)
             if attempt < max_retries:
                 wait_time = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                 logger.warning(
                     "TSA request attempt %d failed: %s. Retrying in %.1fs...",
-                    attempt, exc, wait_time,
+                    attempt, last_error, wait_time,
                 )
                 time.sleep(wait_time)
             else:
@@ -189,6 +235,65 @@ def _send_tsq(tsq_bytes: bytes, tsa_url: str) -> bytes:
     raise TSAError(
         f"TSA request failed after {max_retries} attempts: {last_error}"
     )
+
+
+def _post_tsq(tsq_bytes: bytes, tsa_url: str, timeout: float) -> bytes:
+    """One POST of the TSQ; the reply body under the rules of :func:`_send_tsq`.
+
+    Raises:
+        TSAError: ``tsa_transport`` for a redirect, a content-coded or an
+            oversized reply.
+        requests.RequestException: Network errors and HTTP 4xx/5xx answers
+            (retried by the caller).
+    """
+    with requests.post(
+        tsa_url,
+        data=tsq_bytes,
+        headers={"Content-Type": "application/timestamp-query",
+                 "Accept-Encoding": "identity"},
+        timeout=timeout,
+        allow_redirects=False,
+        stream=True,
+    ) as response:
+        if 300 <= response.status_code < 400:
+            raise _transport_refusal(
+                tsa_url, f"answered with a redirect (HTTP "
+                         f"{response.status_code}); redirects are not followed")
+        response.raise_for_status()
+        encoding = response.headers.get("Content-Encoding", "").strip().lower()
+        if encoding not in ("", "identity"):
+            raise _transport_refusal(
+                tsa_url, f"sent a {encoding}-coded reply; only identity is "
+                         "accepted")
+        content_type = response.headers.get("Content-Type", "")
+        if "application/timestamp-reply" not in content_type:
+            logger.warning("Unexpected Content-Type from TSA: %s", content_type)
+        return _bounded_body(response, tsa_url)
+
+
+def _bounded_body(response: requests.Response, tsa_url: str) -> bytes:
+    """The reply body; refused, not read on, beyond MAX_TSA_REPLY_BYTES."""
+    declared = response.headers.get("Content-Length", "").strip()
+    if declared.isascii() and declared.isdigit() and (
+        int(declared) > MAX_TSA_REPLY_BYTES
+    ):
+        raise _oversized(tsa_url)
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=16 * 1024):
+        body += chunk
+        if len(body) > MAX_TSA_REPLY_BYTES:
+            raise _oversized(tsa_url)
+    return bytes(body)
+
+
+def _oversized(tsa_url: str) -> TSAError:
+    return _transport_refusal(
+        tsa_url, f"reply exceeds {MAX_TSA_REPLY_BYTES} bytes; not read further")
+
+
+def _transport_refusal(tsa_url: str, what: str) -> TSAError:
+    """A ``tsa_transport`` error naming the TSA without URL credentials."""
+    return TSAError(f"TSA {_redact_url(tsa_url)} {what}", code=TSA_TRANSPORT)
 
 
 def verify_timestamp(tst_token: bytes, tsa_cert_path: str) -> datetime:
@@ -352,17 +457,128 @@ def request_timestamp_verified(
     Raises:
         TSAError: On any transport, parse, or verification failure.
     """
-    import secrets
+    _require_tsa_config(tsa_url, tsa_cert_path)
+    nonce = _fresh_nonce()
+    tst_token = _send_tsq(_build_tsq(data_hash, nonce=nonce), tsa_url)
+    _content_info, tst_info = _check_verified_tst(
+        tst_token, data_hash, nonce, tsa_cert_path
+    )
+    return _gen_time_of(tst_info)
 
+
+def request_timestamp_verified_token(
+    data_hash: bytes,
+    tsa_url: str,
+    tsa_cert_path: str,
+) -> VerifiedTimestamp:
+    """Like :func:`request_timestamp_verified`, also returning the token.
+
+    Performs the same fail-closed checks (fresh nonce echoed in the signed
+    TSTInfo, message-imprint equality, CMS signature against the pinned
+    TSA certificate) and additionally requires the imprint algorithm to
+    be SHA-256. The verified DER token is returned so a release decision
+    can be audited and the evidence re-verified later.
+
+    Args:
+        data_hash: SHA-256 hash (32 bytes) the TSA must bind.
+        tsa_url: TSA endpoint URL.
+        tsa_cert_path: PEM path of the TSA certificate to verify against.
+
+    Returns:
+        The verified genTime, token bytes, nonce and TSA serial number.
+
+    Raises:
+        TSAError: On any transport, parse, or verification failure.
+    """
+    _require_tsa_config(tsa_url, tsa_cert_path)
+    nonce = _fresh_nonce()
+    tst_token = _send_tsq(_build_tsq(data_hash, nonce=nonce), tsa_url)
+    _content_info, tst_info = _check_verified_tst(
+        tst_token, data_hash, nonce, tsa_cert_path
+    )
+    algorithm = tst_info["message_imprint"]["hash_algorithm"]["algorithm"]
+    if algorithm.native != "sha256":
+        raise TSAError("TST messageImprint hash algorithm is not SHA-256")
+    return VerifiedTimestamp(
+        gen_time=_gen_time_of(tst_info),
+        token=tst_token,
+        nonce=nonce,
+        serial_number=int(tst_info["serial_number"].native),
+    )
+
+
+def request_timestamp_trusted(
+    data_hash: bytes,
+    tsa_url: str,
+    profile: TsaTrustProfile,
+    *,
+    at: Optional[datetime] = None,
+) -> VerifiedTimestamp:
+    """Request a fresh token and accept it only under a pinned TSA profile.
+
+    The TSA call of the time-locked release path (stage E, E2b). The
+    profile's files and policy OID are checked before the TSA is
+    contacted; the request carries a fresh 64-bit nonce; the response is
+    accepted only by
+    :func:`~desktop.signature.tsa_profile.verify_trusted_token` (binding,
+    chain to a pinned TSA CA, EKU, ESS, signature, validity, policy OID,
+    accuracy).
+
+    Args:
+        data_hash: SHA-256 hash (32 bytes) the TSA must bind.
+        tsa_url: TSA endpoint URL.
+        profile: Pinned TSA CA(s), policy OID and optional leaf pin.
+        at: Verification time for certificate validity (default: now).
+
+    Returns:
+        The verified token with its genTime, accuracy and policy OID.
+
+    Raises:
+        TSAError: Always with a stable ``code``: ``tsa_config``,
+            ``tsa_transport`` (no usable response), or the code of the
+            failed token check.
+    """
+    if not tsa_url:
+        raise TSAError("TSA URL is required", code=TSA_CONFIG)
+    if not isinstance(data_hash, bytes) or len(data_hash) != 32:
+        raise TSAError("the data hash must be a 32-byte SHA-256 value",
+                       code=TSA_IMPRINT)
+    loaded = load_trust_profile(profile)  # refuse before any network traffic
+    nonce = _fresh_nonce()
+    tsq = _build_tsq(data_hash, nonce=nonce)
+    try:
+        tst_token = _send_tsq(tsq, tsa_url)
+    except TSAError as exc:
+        raise TSAError(str(exc), code=exc.code or TSA_TRANSPORT) from exc
+    return verify_trusted_token(tst_token, data_hash, nonce, loaded, at=at)
+
+
+def _require_tsa_config(tsa_url: str, tsa_cert_path: str) -> None:
+    """Refuse to contact a TSA without an URL and a pinned certificate."""
     if not tsa_url:
         raise TSAError("TSA URL is required")
     if not tsa_cert_path:
         raise TSAError("TSA certificate path is required")
 
-    nonce = secrets.randbits(64)
-    tsq_bytes = _build_tsq(data_hash, nonce=nonce)
-    tst_token = _send_tsq(tsq_bytes, tsa_url)
 
+def _fresh_nonce() -> int:
+    """Draw a fresh 64-bit RFC 3161 request nonce."""
+    import secrets
+
+    return secrets.randbits(64)
+
+
+def _check_verified_tst(
+    tst_token: bytes,
+    data_hash: bytes,
+    nonce: int,
+    tsa_cert_path: str,
+) -> tuple["cms.ContentInfo", "tsp.TSTInfo"]:
+    """Structure, imprint, nonce-echo and signature checks (in order).
+
+    Raises:
+        TSAError: On the first failed check (fail-closed).
+    """
     content_info = cms.ContentInfo.load(tst_token)
     if content_info["content_type"].native != "signed_data":
         raise TSAError("TST token is not CMS signed_data")
@@ -373,7 +589,9 @@ def request_timestamp_verified(
     tst_info = tsp.TSTInfo.load(encap["content"].parsed.dump())
 
     imprint = tst_info["message_imprint"]["hashed_message"].native
-    if imprint != data_hash:
+    if not isinstance(imprint, bytes) or not hmac.compare_digest(
+        imprint, data_hash
+    ):
         raise TSAError("TST messageImprint does not match the request hash")
 
     echoed = tst_info["nonce"].native
@@ -384,7 +602,11 @@ def request_timestamp_verified(
         )
 
     _verify_tst_signature(content_info, tsa_cert_path)
+    return content_info, tst_info
 
+
+def _gen_time_of(tst_info: "tsp.TSTInfo") -> datetime:
+    """Return the TSTInfo genTime as an aware datetime (UTC if naive)."""
     gen_time = tst_info["gen_time"].native
     if gen_time is None:
         raise TSAError("TST token contains no genTime")

@@ -5,8 +5,12 @@ the current time against the unlock time anchored at sealing:
 
   - future unlock time  -> recovery denied (403), no TSA involvement
   - past unlock time    -> recovery proceeds
-  - record without the field / no synced record (legacy) -> ungated
+  - record without the field (legacy) -> ungated
   - present but unparseable unlock time -> denied (fail-closed)
+
+The investigator share is entered in the request (stage D re-review), and
+a reconstruction from it is released only against the key commitment:
+records without one, and seals with no synced record, are refused there.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import pytest
 from desktop.crypto.sss_split import split_key
 
 TEST_KEY_HEX = "ab" * 32
+COMMITMENT = hashlib.sha256(bytes.fromhex(TEST_KEY_HEX)).hexdigest()
 CSRF_TOKEN = "test-csrf-token"  # public-test-fixture
 
 
@@ -57,13 +62,14 @@ def _iso(delta_days: int) -> str:
     ).isoformat()
 
 
-def _post_recover(client: Any, seal_id: str) -> Any:
-    """POST the recovery form with a valid CSRF token in the session."""
+def _post_recover(client: Any, seal_id: str, share: str) -> Any:
+    """POST the recovery form (with the investigator share) and CSRF token."""
     with client.session_transaction() as sess:
         sess["csrf_token"] = CSRF_TOKEN
     return client.post(
         "/investigator/recover-key",
-        data={"seal_id": seal_id, "csrf_token": CSRF_TOKEN},
+        data={"seal_id": seal_id, "share_data": share,
+              "csrf_token": CSRF_TOKEN},
     )
 
 
@@ -72,8 +78,11 @@ def _seed(
     seal_id: str,
     record: dict[str, Any] | None,
     record_json_override: str | None = None,
-) -> None:
-    """Insert a case, two valid standard shares, and (optionally) a record."""
+) -> str:
+    """Insert a case, two valid standard shares, and (optionally) a record.
+
+    Returns the investigator share s2, which the recovery form presents.
+    """
     with app.app_context():
         from web.models.db_models import (
             insert_case,
@@ -97,6 +106,7 @@ def _seed(
             insert_seal_record(
                 seal_id, 1, "Sealing", json.dumps(record, ensure_ascii=False)
             )
+    return s2
 
 
 # ===================================================================
@@ -108,22 +118,24 @@ class TestUnlockGateRoute:
 
     def test_future_unlock_denies_403(self, app: Any, client: Any) -> None:
         seal_id = "S-GATE-FUTURE"
-        _seed(app, seal_id, {
+        s2 = _seed(app, seal_id, {
             "seal_mode": "standard",
+            "key_commitment": COMMITMENT,
             "unlock_time_iso": _iso(+1),
         })
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
         assert resp.status_code == 403
         # Distinguish the policy-gate denial from a CSRF 403.
         assert "열람 제한" in resp.get_data(as_text=True)
 
     def test_past_unlock_allows_recovery(self, app: Any, client: Any) -> None:
         seal_id = "S-GATE-PAST"
-        _seed(app, seal_id, {
+        s2 = _seed(app, seal_id, {
             "seal_mode": "standard",
+            "key_commitment": COMMITMENT,
             "unlock_time_iso": _iso(-1),
         })
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
         assert resp.status_code == 302
         assert f"/investigator/recovered/{seal_id}" in resp.headers["Location"]
 
@@ -131,36 +143,43 @@ class TestUnlockGateRoute:
         self, app: Any, client: Any
     ) -> None:
         seal_id = "S-GATE-LEGACYFIELD"
-        _seed(app, seal_id, {"seal_mode": "standard"})
-        resp = _post_recover(client, seal_id)
+        s2 = _seed(app, seal_id, {"seal_mode": "standard",
+                                  "key_commitment": COMMITMENT})
+        resp = _post_recover(client, seal_id, s2)
         assert resp.status_code == 302
 
-    def test_no_synced_record_is_ungated(self, app: Any, client: Any) -> None:
+    def test_no_synced_record_refuses_the_presented_share(
+        self, app: Any, client: Any
+    ) -> None:
+        # No record, no commitment: the presented share cannot be checked.
         seal_id = "S-GATE-NORECORD"
-        _seed(app, seal_id, None)
-        resp = _post_recover(client, seal_id)
-        assert resp.status_code == 302
+        s2 = _seed(app, seal_id, None)
+        resp = _post_recover(client, seal_id, s2)
+        assert resp.status_code == 403
+        assert "확인값" in resp.get_data(as_text=True)
 
     def test_unparseable_unlock_time_denies_500(
         self, app: Any, client: Any
     ) -> None:
         seal_id = "S-GATE-BADTIME"
-        _seed(app, seal_id, {
+        s2 = _seed(app, seal_id, {
             "seal_mode": "standard",
+            "key_commitment": COMMITMENT,
             "unlock_time_iso": "not-a-timestamp",
         })
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
         assert resp.status_code == 500
 
     def test_legacy_unlock_time_key_is_honored(
         self, app: Any, client: Any
     ) -> None:
         seal_id = "S-GATE-LEGACYKEY"
-        _seed(app, seal_id, {
+        s2 = _seed(app, seal_id, {
             "seal_mode": "standard",
+            "key_commitment": COMMITMENT,
             "unlock_time": _iso(+1),
         })
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
         assert resp.status_code == 403
 
 
@@ -240,9 +259,9 @@ class TestCanonicalRecordCrossesTheBoundary:
             )
         )
         record["seal_id"] = seal_id
-        _seed(app, seal_id, record)
+        s2 = _seed(app, seal_id, record)
 
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
 
         assert resp.status_code == 403
         assert "열람 제한" in resp.get_data(as_text=True)
@@ -257,9 +276,9 @@ class TestCanonicalRecordCrossesTheBoundary:
             )
         )
         record["seal_id"] = seal_id
-        _seed(app, seal_id, record)
+        s2 = _seed(app, seal_id, record)
 
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
 
         assert resp.status_code == 302
 
@@ -280,17 +299,22 @@ class TestCommitmentVerification:
         # Commitment of a DIFFERENT key: the shares still combine, but the
         # result is not the key this seal was made with.
         record["key_commitment"] = hashlib.sha256(b"another key").hexdigest()
-        _seed(app, seal_id, record)
+        s2 = _seed(app, seal_id, record)
 
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
 
         assert resp.status_code == 400
         assert "확인값" in resp.get_data(as_text=True)
 
-    def test_legacy_record_without_commitment_still_recovers(
+    def test_record_without_commitment_is_refused(
         self, app: Any, client: Any
     ) -> None:
-        """Pre-commitment seals must keep working (documented legacy path)."""
+        """Pre-commitment seals: a presented share cannot be verified.
+
+        The stored s1 combined with a chosen s2 would reveal s1, so the
+        standard path refuses even the correct share; the admin path
+        (stored shares only) remains for these seals.
+        """
         seal_id = "S-GATE-NOCOMMIT"
         record = TestCanonicalRecordCrossesTheBoundary._canonical_record(
             (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime(
@@ -299,11 +323,12 @@ class TestCommitmentVerification:
         )
         record["seal_id"] = seal_id
         del record["key_commitment"]
-        _seed(app, seal_id, record)
+        s2 = _seed(app, seal_id, record)
 
-        resp = _post_recover(client, seal_id)
+        resp = _post_recover(client, seal_id, s2)
 
-        assert resp.status_code == 302
+        assert resp.status_code == 403
+        assert "확인값" in resp.get_data(as_text=True)
 
 
 class TestFindLatestUnlockTime:

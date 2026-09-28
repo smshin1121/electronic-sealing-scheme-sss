@@ -11,6 +11,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from typing import Any, Mapping
 
 from .exceptions import RecordValidationError
 
@@ -50,6 +51,11 @@ _TOP_LEVEL_FIELDS = frozenset({
     "seal_id", "seal_mode", "unlock_time_iso", "key_commitment",
     "case_info", "process_info", "file_info", "signer_info", "history",
 })
+# Authenticated policy fields (desktop.signature.seal_policy.POLICY_FIELDS).
+# Optional: legacy records carry none of them. An unsealing does not change
+# the key, the unlock time or the mode, so the signed policy stays in force
+# and is carried forward verbatim; a resealing signs a new one.
+_POLICY_FIELDS = ("policy", "policy_signature", "policy_cert")
 
 # ---------------------------------------------------------------------------
 # seal_id generation
@@ -69,6 +75,59 @@ def create_seal_id() -> str:
     date_part = now.strftime("%Y%m%d")
     random_hex = os.urandom(3).hex().upper()
     return f"S-{date_part}-{random_hex}"
+
+
+def seal_mode_of(record: Mapping[str, Any]) -> str:
+    """Return the recovery regime (``"standard"``/``"strict"``) of a record.
+
+    A record without ``seal_mode`` predates the field and is standard.
+    When a signed policy is attached, its ``seal_mode`` must be the
+    record's: a mode that was stripped or edited after signing does not
+    silently fall back to standard.
+
+    Raises:
+        RecordValidationError: On an unknown mode, or a mode that differs
+            from the attached policy's.
+    """
+    mode = record.get("seal_mode", _DEFAULT_SEAL_MODE)
+    if mode not in _VALID_SEAL_MODES:
+        raise RecordValidationError([
+            f"seal_mode '{mode}' is not one of {sorted(_VALID_SEAL_MODES)}"
+        ])
+    if "policy" in record:
+        policy = record["policy"]
+        policy_mode = policy.get("seal_mode") if isinstance(policy, Mapping) else None
+        if policy_mode != mode:
+            raise RecordValidationError([
+                f"seal_mode '{mode}' differs from the signed policy's "
+                f"'{policy_mode}'"
+            ])
+    return mode
+
+
+def is_valid_seal_id(seal_id: object) -> bool:
+    """Return True if ``seal_id`` has the record format ``S-YYYYMMDD-XXXXXX``.
+
+    The whole string must match (no trailing newline), so an ID accepted
+    here is always accepted by :func:`validate_record`.
+    """
+    return isinstance(seal_id, str) and bool(_SEAL_ID_PATTERN.fullmatch(seal_id))
+
+
+# A seal_id read from a record file becomes part of output file names; it
+# must be a plain token (record format or the legacy ``SEAL-`` case IDs).
+_SAFE_SEAL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")
+
+
+def is_safe_seal_id(seal_id: object) -> bool:
+    """Return True if ``seal_id`` is safe to use in an output file name.
+
+    Letters, digits and hyphens only (at most 64 characters), so no path
+    separator, drive letter or ``..`` can reach a file path. Wider than
+    :func:`is_valid_seal_id`: records sealed before the format was enforced
+    carry ``SEAL-XXXXXXXXXXXX`` IDs.
+    """
+    return isinstance(seal_id, str) and bool(_SAFE_SEAL_ID_PATTERN.fullmatch(seal_id))
 
 
 # ---------------------------------------------------------------------------
@@ -116,16 +175,17 @@ def build_seal_record(
         RecordValidationError: If ``unlock_time_iso`` is empty, or
             ``key_commitment`` is missing or malformed.
     """
+    # RecordValidationError takes a list of messages (it joins them).
     if not unlock_time_iso:
-        raise RecordValidationError(
+        raise RecordValidationError([
             "unlock_time_iso is required: a sealing record must carry the "
             "time-lock policy it is signed under"
-        )
+        ])
     if not key_commitment or not _KEY_COMMITMENT_PATTERN.match(key_commitment):
-        raise RecordValidationError(
+        raise RecordValidationError([
             "key_commitment must be SHA-256 of the recovery key as 64 "
             "lowercase hex characters"
-        )
+        ])
 
     record: dict = {
         "seal_id": seal_id,
@@ -149,8 +209,11 @@ def build_unseal_record(
     """Build an unsealing record (봉인해제기록지).
 
     Carries forward ``seal_id``, ``case_info``, and ``signer_info``
-    from the previous record.  ``history`` is inherited as-is; the
-    caller is responsible for appending the unseal event beforehand.
+    from the previous record, and -- when present -- the authenticated
+    ``policy``/``policy_signature``/``policy_cert`` unchanged (the key and
+    the time lock do not change on unsealing).  ``history`` is inherited
+    as-is; the caller is responsible for appending the unseal event
+    beforehand.
 
     Args:
         prev_record: The most recent seal/reseal record.
@@ -177,7 +240,10 @@ def build_unseal_record(
         "signer_info": prev["signer_info"],
         "history": prev["history"],
     }
-    return record
+    carried_policy = {
+        name: prev[name] for name in _POLICY_FIELDS if name in prev
+    }
+    return {**record, **carried_policy}
 
 
 def build_reseal_record(

@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,33 @@ class SealTimestampError(SealRecordError):
     """Timestamp evidence could not be obtained or verified."""
 
 
+class SealKeyProtectionError(SealRecordError):
+    """S7: the signing key could not be wrapped under the master key.
+
+    Nothing is saved. Before stage E, E2f, S7 then stored the subject's
+    password-protected key PEM without the envelope, silently.
+    """
+
+
+def _wrapped_signing_key(key_pem: bytes) -> bytes:
+    """S7: the signing-key PEM under the master-key envelope.
+
+    Raises:
+        SealKeyProtectionError: The master key is unavailable or the wrap
+            failed; S7 saves nothing (stage E, E2f).
+    """
+    try:
+        from .crypto import encrypt_envelope, get_master_key_path
+
+        return encrypt_envelope(key_pem, get_master_key_path())
+    except Exception as exc:
+        raise SealKeyProtectionError(
+            "서명 키를 마스터 키로 보호하지 못해 봉인을 저장하지 않았습니다. "
+            "마스터 키 파일(MASTER_KEY_PATH)을 확인한 뒤 다시 시도하세요 "
+            f"(signing key not wrapped: {type(exc).__name__}: {exc})"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class SealConfig:
     """Immutable configuration collected from wizard steps S1-S3."""
@@ -53,13 +80,16 @@ class SealConfig:
     media: dict[str, str]
     subject: dict[str, str]
     signature_lines: list[tuple[int, int, int, int]]
-    # Deployment-selectable recovery regime (no UI branch): "standard"
-    # keeps SSS 2-of-4; "strict" requires s1 in every recovery path.
+    # Recovery regime chosen when sealing: "standard" keeps SSS 2-of-4
+    # (the default); "strict" requires s1 in every recovery path.
     seal_mode: str = "standard"
     # Days until the time-locked share may be released. Fixed here so S4
     # can write the resulting unlock time into the record BEFORE S5 signs
     # it — the policy is then covered by the subject's signature.
     unlock_days: int = 10
+    # Seal ID registered beforehand in the case manager; S4 generates one
+    # when None. It must have the record format (validate_record).
+    seal_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -72,15 +102,52 @@ class SealResult:
     key_shares: tuple[str, str, str, str]
     unlock_time_iso: str
     record_json: str
+    # Base64 envelope ciphertext of s3 bound to the signed policy, to be
+    # synced with the record as ``wrapped_s3``; None for a legacy record.
+    wrapped_s3_b64: Optional[str] = None
 
 
 class SealProcess:
     """Orchestrates the sealing workflow steps S1 through S7."""
 
-    def __init__(self, *, db_path: str) -> None:
+    def __init__(
+        self,
+        *,
+        db_path: str,
+        policy_signer: Optional[Any] = None,
+    ) -> None:
+        """Create a sealing process.
+
+        Args:
+            db_path: Desktop SQLite database path.
+            policy_signer: Institutional seal-policy signer
+                (:class:`desktop.signature.seal_policy.PolicySigner`).
+                When ``None`` the signer is resolved from the environment
+                at S4; if none is configured the record stays legacy.
+        """
         self._db_path = db_path
+        self._policy_signer = policy_signer
         self.config: Optional[SealConfig] = None
         self.state: dict[str, Any] = {}
+
+    def policy_signer_available(self) -> bool:
+        """Whether S4 will try to sign a policy (strict mode requires one).
+
+        True for an injected signer, or when either policy path variable is
+        set: a partial or broken configuration then fails loudly at S4
+        (``PolicyError``) instead of being reported as "not configured".
+        """
+        if self._policy_signer is not None:
+            return True
+        from desktop.signature.seal_policy import (
+            POLICY_CERT_PATH_ENV,
+            POLICY_KEY_PATH_ENV,
+        )
+
+        return any(
+            os.environ.get(name, "").strip()
+            for name in (POLICY_KEY_PATH_ENV, POLICY_CERT_PATH_ENV)
+        )
 
     def run_s1(
         self,
@@ -93,15 +160,22 @@ class SealProcess:
 
         MD5/SHA-256 metadata is computed inline during the encryption
         read (single pass), so no separate hash pass is required.
+
+        A retry after a cancelled or failed run reuses the session key:
+        ``.enc.progress`` resume appends to chunks written under that key,
+        so a new key would make the container permanently undecryptable
+        (the crypto layer's key-fingerprint guard is a second defence).
         """
         from .crypto import MAX_CHUNK_SIZE, encrypt_file
 
         chunk_bytes = min(chunk_size_gb * (1024 ** 3), MAX_CHUNK_SIZE)
-        aes_key = os.urandom(32)
-        aes_key_hex = aes_key.hex()
+        aes_key_hex = self.state.get("s1_aes_key_hex")
+        if aes_key_hex is None:
+            aes_key_hex = os.urandom(32).hex()
+            self.state["s1_aes_key_hex"] = aes_key_hex
+        aes_key = bytes.fromhex(aes_key_hex)
 
-        src_name = Path(source_file).stem
-        enc_path = str(Path(output_dir) / f"{src_name}.enc")
+        enc_path = seal_output_path(source_file, output_dir)
         result = encrypt_file(
             filepath=source_file,
             aes_key=aes_key,
@@ -147,10 +221,10 @@ class SealProcess:
         if "s1" not in self.state:
             raise RuntimeError("S1 must complete before S4")
 
+        from .db.sqlite_store import unused_seal_id
         from .record import (
             build_seal_record,
             create_initial_history,
-            create_seal_id,
             validate_record,
         )
 
@@ -167,7 +241,16 @@ class SealProcess:
         key_commitment = hashlib.sha256(
             bytes.fromhex(self.state["s1"]["aes_key_hex"])
         ).hexdigest()
-        seal_id = create_seal_id()
+        # A case registered in the case manager keeps its seal_id (an ID
+        # without the record format is refused by validate_record below).
+        # A retry after a failed S5-S7 keeps the ID of the first attempt, so
+        # the files S5 wrote are overwritten instead of left orphaned.
+        # A new ID is one with no row in this desktop's database (F9).
+        seal_id = (
+            self.config.seal_id
+            or self.state.get("s4", {}).get("seal_id")
+            or unused_seal_id(self._db_path)
+        )
         investigator_name = self.config.investigator.get("name", "")
         s1 = self.state["s1"]
         meta = s1["metadata"]
@@ -250,7 +333,32 @@ class SealProcess:
         if errors:
             raise RuntimeError(f"Seal record validation failed: {errors}")
 
-        self.state["s4"] = {"seal_id": seal_id, "record_dict": record}
+        # Authenticated canonical policy (seal_id, case number, mode, unlock
+        # time, key commitment, generation 1), signed by the institutional
+        # policy key before S5 renders and signs the record. Without a
+        # configured key the record stays legacy (warning); a broken
+        # configuration aborts.
+        from desktop.signature.seal_policy import (
+            FIRST_POLICY_GENERATION,
+            attach_policy_if_configured,
+        )
+
+        record, policy_digest = attach_policy_if_configured(
+            record, self._policy_signer, generation=FIRST_POLICY_GENERATION,
+        )
+        # Strict mode is only as good as the binding of its mode: without a
+        # signed policy an edited record could be resealed as standard.
+        if self.config.seal_mode == "strict" and policy_digest is None:
+            raise SealRecordError(
+                "strict mode requires a signed seal policy: configure the "
+                "institutional policy key (ENC_ENVELOPE_POLICY_KEY_PATH / "
+                "ENC_ENVELOPE_POLICY_CERT_PATH)"
+            )
+        self.state["s4"] = {
+            "seal_id": seal_id,
+            "record_dict": record,
+            "policy_digest": policy_digest,
+        }
         logger.info("S4 complete: seal_id=%s", seal_id)
         return self.state["s4"]
 
@@ -446,7 +554,9 @@ class SealProcess:
 
         Standard mode uses SSS 2-of-4; strict mode uses the outer
         2-of-2 XOR wrap (owner share required in every recovery path).
-        Shares 3/4 are envelope-wrapped identically in both modes.
+        Shares 3/4 are envelope-wrapped in both modes; when S4 signed a
+        policy, s3 is additionally bound to (seal_id, policy digest) and
+        exposed as ``wrapped_s3_b64`` for the sync payload.
 
         The unlock time is *read* from the signed record built in S4 —
         it is never recomputed here, so the value the shares are governed
@@ -459,12 +569,12 @@ class SealProcess:
 
         from .crypto import (
             SEAL_MODE_STRICT,
-            encrypt_envelope,
             get_master_key_path,
             recover_key_for_mode,
             split_key,
             split_key_strict,
         )
+        from .s3_wrap import wrap_institutional_shares
 
         mode = self.config.seal_mode if self.config else "standard"
         aes_key_hex = self.state["s1"]["aes_key_hex"]
@@ -476,15 +586,18 @@ class SealProcess:
         if recovered != aes_key_hex:
             raise RuntimeError("Key-split recovery self-check failed")
 
-        master_path = get_master_key_path()
-        enc_share_3 = encrypt_envelope(shares[2].encode("utf-8"), master_path)
-        enc_share_4 = encrypt_envelope(shares[3].encode("utf-8"), master_path)
+        encrypted_shares, wrapped_s3_b64 = wrap_institutional_shares(
+            shares, get_master_key_path(),
+            seal_id=self.state["s4"]["seal_id"],
+            policy_digest=self.state["s4"].get("policy_digest"),
+        )
 
         unlock_time_iso = self.state["s4"]["record_dict"]["unlock_time_iso"]
         step_result = {
             "shares": shares,
             "unlock_time_iso": unlock_time_iso,
-            "encrypted_shares": {3: enc_share_3, 4: enc_share_4},
+            "encrypted_shares": encrypted_shares,
+            "wrapped_s3_b64": wrapped_s3_b64,
         }
         self.state["s6"] = step_result
         logger.info("S6 complete: unlock_time=%s", unlock_time_iso)
@@ -509,18 +622,12 @@ class SealProcess:
 
         cert_pem = self.state["s5"].get("cert_pem", "")
         key_pem = self.state["s5"].get("key_pem", b"")
-        key_encrypted = key_pem
-        if cert_pem:
-            try:
-                from .crypto import encrypt_envelope, get_master_key_path
+        key_encrypted = _wrapped_signing_key(key_pem) if cert_pem else key_pem
 
-                master_path = get_master_key_path()
-                key_encrypted = encrypt_envelope(key_pem, master_path)
-            except Exception:
-                key_encrypted = key_pem
-
-        # Persist record, key shares, and certificate atomically in a
-        # single transaction (all-or-nothing).
+        # Record, shares, certificate, case columns and the sync delivery
+        # intent in one transaction (all-or-nothing; stage E, E2d). Only a
+        # seal started from a registered case may fill its placeholder.
+        intent = self._sync_intent(record_json, pdf_path)
         save_seal_bundle(
             self._db_path,
             seal_id,
@@ -529,6 +636,9 @@ class SealProcess:
             shares=self.state["s6"]["encrypted_shares"],
             cert_pem=cert_pem,
             key_pem_encrypted=key_encrypted,
+            case_meta=self._case_meta(record_dict),
+            registered_case_id=self.config.seal_id if self.config else None,
+            extra_writes=intent.write,
         )
 
         shares = self.state["s6"]["shares"]
@@ -539,10 +649,48 @@ class SealProcess:
             key_shares=(shares[0], shares[1], shares[2], shares[3]),
             unlock_time_iso=self.state["s6"]["unlock_time_iso"],
             record_json=record_json,
+            wrapped_s3_b64=self.state["s6"].get("wrapped_s3_b64"),
         )
         self.state["s7"] = {"seal_result": result}
         logger.info("S7 complete: seal_id=%s", seal_id)
+        intent.deliver()
         return result
+
+    def _sync_intent(self, record_json: str, pdf_path: str) -> Any:
+        """Stage E (E2a, E2d): the delivery intent of the record S7 saves.
+
+        Its outbox rows are written in the save's transaction; the push
+        after it never fails the seal.
+        """
+        from .sync import prepare_sync
+
+        return prepare_sync(
+            self._db_path, event_type="Sealing", record_json=record_json,
+            pdf_path=pdf_path,
+            wrapped_s3_b64=self.state["s6"].get("wrapped_s3_b64"),
+            signer=self._policy_signer,
+        )
+
+    def _case_meta(self, record_dict: dict[str, Any]) -> Optional[dict[str, str]]:
+        """Searchable case columns written with the S7 bundle (None: skip)."""
+        if self.config is None:
+            return None
+        history = record_dict.get("history") or {}
+        return {
+            "case_number": self.config.case_number,
+            "suspect_name": self.config.subject.get("name", ""),
+            "investigator": self.config.investigator.get("name", ""),
+            "status": history.get("summary", "S1U0R0"),
+        }
+
+
+def seal_output_path(source_file: str, output_dir: str) -> str:
+    """Path of the container S1 writes: ``<output_dir>/<source name>.enc``.
+
+    The full source name is kept (``disk.dd`` -> ``disk.dd.enc``) so two
+    sources that differ only by extension never share one output file.
+    """
+    return str(Path(output_dir) / f"{Path(source_file).name}.enc")
 
 
 def _read_enc_metadata(enc_filepath: str) -> dict[str, Any]:
@@ -586,55 +734,33 @@ def _signature_hash(signature_lines: list[tuple[int, int, int, int]]) -> str:
 
 def run_seal_in_background(
     process: SealProcess,
-    wizard_data: dict[str, Any],
+    wizard_data: Mapping[str, Any],
     *,
     db_path: str,
     on_step: Optional[Callable[[str, str], None]] = None,
     on_complete: Optional[Callable[[SealResult], None]] = None,
     on_error: Optional[Callable[[str, Exception], None]] = None,
 ) -> threading.Thread:
-    """Run the full seal process on a background thread."""
+    """Run :func:`desktop.seal_steps.run_seal_steps` on a background thread.
 
-    def _notify(step: str, msg: str) -> None:
-        if on_step:
-            on_step(step, msg)
+    ``on_error`` receives the failing step (``"S4"``-``"S7"``) and its
+    exception. The callbacks run on the worker thread; a Tk caller must
+    marshal them (the seal wizard uses ``run_async`` instead).
+    ``db_path`` is unused (the process holds its own) and kept for
+    signature compatibility.
+    """
+    from .seal_steps import SealStepError, run_seal_steps
 
     def _run() -> None:
         try:
-            config = SealConfig(
-                source_file=wizard_data["source_file"],
-                output_dir=wizard_data["output_dir"],
-                chunk_size_bytes=wizard_data["chunk_size_gb"] * (1024 ** 3),
-                case_number=wizard_data["case_number"],
-                investigator=wizard_data.get("investigator", {}),
-                seizure=wizard_data.get("seizure", {}),
-                media=wizard_data.get("media", {}),
-                subject=wizard_data.get("subject", {}),
-                signature_lines=wizard_data.get("signature_lines", []),
-                seal_mode=wizard_data.get("seal_mode", "standard"),
-                unlock_days=wizard_data.get("unlock_days", 10),
-            )
-            process.set_config(config)
-
-            _notify("S4", "Building seal record")
-            process.run_s4()
-
-            _notify("S5", "Generating signed record artifacts")
-            process.run_s5(status_cb=lambda msg: _notify("S5", msg))
-
-            _notify("S6", "Splitting AES key")
-            process.run_s6()
-
-            _notify("S7", "Saving seal record")
-            result = process.run_s7()
-
-            if on_complete:
-                on_complete(result)
-
-        except Exception as exc:
-            logger.exception("Seal workflow failed")
+            result = run_seal_steps(process, wizard_data, on_step=on_step)
+        except SealStepError as exc:
+            logger.exception("Seal workflow failed at %s", exc.step)
             if on_error:
-                on_error("unknown", exc)
+                on_error(exc.step, exc.cause)
+            return
+        if on_complete:
+            on_complete(result)
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()

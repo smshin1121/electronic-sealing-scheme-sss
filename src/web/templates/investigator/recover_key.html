@@ -4,7 +4,12 @@
 <div class="row justify-content-center">
     <div class="col-md-8">
         <h3 class="mb-4">SSS 키 복원</h3>
-        <p class="text-muted">업로드된 키 조각(2개 이상)으로 원본 AES 키를 복원합니다.</p>
+        <p class="text-muted">
+            피압수자가 올린 키 조각(1)과 여기에 입력한 수사관 키 조각(2)으로
+            원본 AES 키를 복원합니다. 수사관 키 조각을 가진 사람만 요청할 수
+            있으며, 복원된 키는 봉인 기록의 확인값과 일치할 때만 표시됩니다
+            (입력한 조각은 기록하지 않습니다).
+        </p>
 
         <form method="POST" action="{{ url_for('investigator.recover_key') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -15,8 +20,21 @@
                        placeholder="S-20251104-ABA82E" required>
             </div>
 
+            <div class="mb-3">
+                <label for="share_data" class="form-label required">수사관 키 조각 (2)</label>
+                <textarea class="form-control font-monospace" id="share_data"
+                          name="share_data" rows="2" autocomplete="off"
+                          spellcheck="false" placeholder="2-..." required></textarea>
+            </div>
+
             <button type="submit" class="btn btn-warning">키 복원</button>
         </form>
+
+        <p class="mt-4 small">
+            피압수자 키 조각 없이 열람 해제 시각 이후에 복원하려면
+            <a href="{{ url_for('investigator.recover_key_timelock') }}">시간 잠금 해제</a>를
+            사용하세요.
+        </p>
     </div>
 </div>
 {% endblock %}

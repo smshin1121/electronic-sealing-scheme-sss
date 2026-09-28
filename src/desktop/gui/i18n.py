@@ -162,7 +162,7 @@ _TRANSLATIONS = {
     },
     "seal.case_info": {"ko": "사건 정보", "en": "Case Information"},
     "seal.case_number": {"ko": "사건번호", "en": "Case Number"},
-    "seal.seizure_date": {"ko": "압수일시", "en": "Seizure Date"},
+    "seal.seizure_date": {"ko": "압수일시 (UTC)", "en": "Seizure Date (UTC)"},
     "seal.seizure_location": {"ko": "압수장소", "en": "Seizure Location"},
     "seal.media_info": {"ko": "매체정보", "en": "Media Info"},
     "seal.media_manufacturer": {"ko": "저장매체 제조사", "en": "Storage Manufacturer"},
@@ -201,8 +201,8 @@ _TRANSLATIONS = {
         "en": "Signature complete! Press 'Next'.",
     },
     "seal.s6_title": {
-        "ko": "S6. 키 분할 결과 및 접근제어 시간 설정",
-        "en": "S6. Key Split Results & Access Control",
+        "ko": "S6. 키 분할 결과 및 열람 제한 시각",
+        "en": "S6. Key Split Results & Unlock Time",
     },
     "seal.unlock_time": {"ko": "열람 제한 기간 (일)", "en": "Access Restriction Period (days)"},
     "seal.unlock_label": {"ko": "* unlock_time (일)", "en": "* unlock_time (days)"},
@@ -226,6 +226,10 @@ _TRANSLATIONS = {
     "unseal.aes_key_title": {"ko": "AES 키 입력", "en": "AES Key Input"},
     "unseal.aes_key": {"ko": "AES 키 (64자리 hex)", "en": "AES Key (64-char hex)"},
     "unseal.key_load": {"ko": ".key 파일 로드", "en": "Load key file"},
+    "unseal.key_hint": {
+        "ko": "AES 키는 원격참여시스템의 해제 지점에서 키 조각을 모아 복구한 값입니다. 필요한 조각은 봉인 모드에 따라 다르며, 다음 단계에서 표시됩니다 (strict: 피압수자 조각 s1 + 기관 조각 하나).",
+        "en": "The AES key is the one recovered from the key shares at the release gate of the remote participation system. The shares needed depend on the seal mode and are shown at the next step (strict: the subject's share s1 plus one institutional share).",
+    },
     "unseal.show_key": {"ko": "키 표시", "en": "Show key"},
     "unseal.unseal_info": {"ko": "봉인해제 정보", "en": "Unseal Information"},
     "unseal.reason": {"ko": "봉인해제 사유", "en": "Unseal Reason"},
@@ -243,6 +247,11 @@ _TRANSLATIONS = {
         "en": "U6. Unseal Record Preview",
     },
     "unseal.u7_title": {"ko": "U7. 봉인해제 완료", "en": "U7. Unsealing Complete"},
+    "unseal.u7_save_failed_title": {"ko": "봉인해제 기록 저장 안 됨", "en": "Unseal Record Not Saved"},
+    "unseal.u7_save_failed_msg": {
+        "ko": "봉인해제 기록을 이 PC의 DB에 저장하지 않았습니다. 기록지 파일은 출력 폴더에 있습니다.\n{error}",
+        "en": "The unseal record was not saved to this PC's database. The record files are in the output folder.\n{error}",
+    },
     "unseal.cancel_confirm": {
         "ko": "봉인해제 프로세스를 취소하시겠습니까?",
         "en": "Cancel the unsealing process?",
@@ -310,7 +319,7 @@ _TRANSLATIONS = {
         "en": "R6. Reseal Record Preview",
     },
     "reseal.r7_title": {
-        "ko": "R7. 키 분할 결과 및 접근제어 시간 설정",
+        "ko": "R7. 키 분할 결과 및 접근제어 시간 확인",
         "en": "R7. Key Split Results & Access Control",
     },
     "reseal.r8_title": {"ko": "R8. 재봉인 완료", "en": "R8. Resealing Complete"},
@@ -572,27 +581,87 @@ _TRANSLATIONS = {
         "en": "  Seal record PDF and key shares have been saved.",
     },
     "complete.key_instruction": {
-        "ko": "  피압수자 키 조각(1)과 수사관 키 조각(2)은\n  각각의 저장매체에 안전하게 보관하세요.",
-        "en": "  Subject key share (1) and investigator key share (2)\n  must be securely stored on separate media.",
+        "ko": "  키 조각 파일 1은 피압수자에게, 2는 담당 수사관에게 전달해\n  각자 안전하게 보관하게 하세요.",
+        "en": "  Give share file 1 to the subject and share file 2 to the investigator;\n  each keeps it safely.",
     },
 
     # Key split messages
     "keysplit.complete_title": {"ko": "키 분할 완료 (SSS 2-of-4)", "en": "Key Split Complete (SSS 2-of-4)"},
-    "keysplit.share_subject": {"ko": "  키 조각 1 (피압수자): {v}...", "en": "  Share 1 (Subject): {v}..."},
-    "keysplit.share_investigator": {"ko": "  키 조각 2 (수사관):   {v}...", "en": "  Share 2 (Investigator): {v}..."},
-    "keysplit.share_system": {"ko": "  키 조각 3 (시스템):   {v}...", "en": "  Share 3 (System):       {v}..."},
-    "keysplit.share_admin": {"ko": "  키 조각 4 (관리자):   {v}...", "en": "  Share 4 (Admin):        {v}..."},
+    "keysplit.share_subject": {"ko": "  키 조각 1 (피압수자) 지문: {v}", "en": "  Share 1 (Subject) fingerprint: {v}"},
+    "keysplit.share_investigator": {"ko": "  키 조각 2 (수사관) 지문:   {v}", "en": "  Share 2 (Investigator) fingerprint: {v}"},
+    "keysplit.share_system": {"ko": "  키 조각 3 (시스템) 지문:   {v}", "en": "  Share 3 (System) fingerprint:       {v}"},
+    "keysplit.share_admin": {"ko": "  키 조각 4 (관리자) 지문:   {v}", "en": "  Share 4 (Admin) fingerprint:        {v}"},
+    "keysplit.fingerprint_note": {
+        "ko": "  (지문 = 조각의 SHA-256 앞 16자리. 조각 내용은 화면에 표시하지 않습니다.)",
+        "en": "  (Fingerprint = first 16 hex digits of the share's SHA-256. Share contents are not displayed.)",
+    },
     "keysplit.subject_store": {
-        "ko": "키 조각 1은 피압수자 저장매체에 저장됩니다.",
-        "en": "Share 1 is stored on the subject's storage media.",
+        "ko": "키 조각 1(피압수자용)은 아래에서 파일로 저장해 피압수자에게 전달합니다.",
+        "en": "Share 1 (subject) is saved to a file below and given to the subject.",
     },
     "keysplit.investigator_store": {
-        "ko": "키 조각 2는 수사관 저장매체에 저장됩니다.",
-        "en": "Share 2 is stored on the investigator's storage media.",
+        "ko": "키 조각 2(수사관용)는 아래에서 파일로 저장해 담당 수사관이 보관합니다.",
+        "en": "Share 2 (investigator) is saved to a file below and kept by the investigator.",
     },
     "keysplit.system_store": {
-        "ko": "키 조각 3, 4는 시스템에 암호화 저장됩니다.",
-        "en": "Shares 3, 4 are encrypted and stored in the system.",
+        "ko": "키 조각 3·4는 마스터 키로 암호화해 이 PC의 DB에 보관합니다 (화면에 표시하지 않음).",
+        "en": "Shares 3 and 4 are encrypted with the master key and kept in this PC's database (not displayed).",
+    },
+
+    # Share handout (S6 / R7): shares 1 and 2 saved to .share files
+    "handout.title": {"ko": "키 조각 파일 전달", "en": "Share Files to Hand Out"},
+    "handout.intro": {
+        "ko": "키 조각 1과 2를 각각 별도의 파일(.share)로 저장하세요. 조각 내용은 화면에 표시하지 않으며, 두 조각을 모두 저장해야 다음 단계로 진행할 수 있습니다.",
+        "en": "Save shares 1 and 2 to two separate files (.share). Share contents are not displayed; both must be saved before you can continue.",
+    },
+    "handout.strict_notice": {
+        "ko": "strict 모드: 키 조각 1은 반드시 피압수자에게 전달해야 합니다. 이 조각이 없으면 누구도 키를 복구할 수 없습니다.",
+        "en": "Strict mode: share 1 must be given to the subject. Without it, nobody can recover the key.",
+    },
+    "handout.share1_label": {"ko": "키 조각 1 — 피압수자에게 전달", "en": "Share 1 — give to the subject"},
+    "handout.share2_label": {"ko": "키 조각 2 — 담당 수사관 보관", "en": "Share 2 — kept by the investigator"},
+    "handout.save": {"ko": "파일로 저장…", "en": "Save to file…"},
+    "handout.not_saved": {"ko": "아직 저장하지 않음", "en": "Not saved yet"},
+    "handout.saved": {"ko": "저장됨: {path} (지문 {fingerprint})", "en": "Saved: {path} (fingerprint {fingerprint})"},
+    "handout.dialog_title1": {"ko": "키 조각 1 (피압수자용) 저장", "en": "Save Share 1 (Subject)"},
+    "handout.dialog_title2": {"ko": "키 조각 2 (수사관용) 저장", "en": "Save Share 2 (Investigator)"},
+    "handout.error_title": {"ko": "키 조각 저장 실패", "en": "Share Not Saved"},
+    "handout.error_exists": {
+        "ko": "이미 있는 파일입니다. 덮어쓰지 않으니 다른 이름을 선택하세요.\n{path}",
+        "en": "The file already exists and is not overwritten. Choose another name.\n{path}",
+    },
+    "handout.error_same_path": {
+        "ko": "키 조각 1과 2는 서로 다른 파일에 저장해야 합니다.",
+        "en": "Shares 1 and 2 must be saved to different files.",
+    },
+    "handout.error_extension": {
+        "ko": "키 조각 파일의 확장자는 .share여야 합니다.\n{path}",
+        "en": "A share file must have the extension .share.\n{path}",
+    },
+    "handout.error_verify": {
+        "ko": "저장한 파일을 다시 읽어 확인하지 못해 지웠습니다. 다시 저장하세요.\n{path}",
+        "en": "The saved file did not read back correctly and was removed. Save it again.\n{path}",
+    },
+    "handout.error_io": {
+        "ko": "파일을 저장하지 못했습니다: {detail}\n{path}",
+        "en": "The file could not be saved: {detail}\n{path}",
+    },
+    "handout.error_format": {
+        "ko": "키 조각의 형식이 올바르지 않아 저장하지 않았습니다.",
+        "en": "The share is malformed and was not saved.",
+    },
+    "handout.temp_left_title": {"ko": "임시 파일 삭제 필요", "en": "Delete the Temporary File"},
+    "handout.temp_left_msg": {
+        "ko": "키 조각을 저장하고 다시 읽어 확인했습니다. 다만 운영체제가 같은 폴더의 임시 파일을 지우지 못했습니다. 이 파일에도 같은 키 조각이 들어 있으니 직접 삭제하세요.\n{path}",
+        "en": "The share was saved and read back, but the operating system did not let the temporary file in the same folder be deleted. It holds the same share; delete it yourself.\n{path}",
+    },
+    "handout.save_both_first": {
+        "ko": "키 조각 1과 2를 모두 파일로 저장해야 다음 단계로 진행할 수 있습니다.",
+        "en": "Save shares 1 and 2 to files before continuing.",
+    },
+    "handout.save_then_next": {
+        "ko": "키 조각 1과 2를 파일로 저장한 뒤 '다음'을 누르세요.",
+        "en": "Save shares 1 and 2 to files, then press 'Next'.",
     },
     "keysplit.run_prompt": {"ko": "키 분할을 실행하려면 '다음'을 클릭하세요.", "en": "Click 'Next' to execute key split."},
     "keysplit.failed": {"ko": "키 분할 실패 — 로그를 확인하세요.", "en": "Key split failed — check logs."},
@@ -656,8 +725,20 @@ _TRANSLATIONS = {
         "en": "  Reseal record PDF and key shares have been saved.",
     },
     "complete.reseal_key_instruction": {
-        "ko": "  피압수자 키 조각(1)과 수사관 키 조각(2)은\n  각각의 저장매체에 안전하게 보관해주세요.",
-        "en": "  Subject key share (1) and investigator key share (2)\n  must be securely stored on separate media.",
+        "ko": "  새 키 조각 파일 1은 피압수자에게, 2는 담당 수사관에게 전달해\n  각자 안전하게 보관하게 하세요.",
+        "en": "  Give the new share file 1 to the subject and share file 2 to the investigator;\n  each keeps it safely.",
+    },
+    "reseal.saving": {"ko": "재봉인 기록 저장 중...", "en": "Saving the reseal record..."},
+    "reseal.saving_badge": {"ko": "저장 중", "en": "Saving"},
+    "reseal.not_saved_badge": {"ko": "저장 안 됨", "en": "Not saved"},
+    "reseal.save_failed_title": {"ko": "재봉인 저장 실패", "en": "Reseal Not Saved"},
+    "reseal.save_failed_msg": {
+        "ko": "재봉인 기록과 키 조각 3·4를 저장하지 못했습니다.\n\n{v}\n\n원인을 해결한 뒤 '완료'를 눌러 다시 시도하세요.",
+        "en": "The reseal record and shares 3 and 4 could not be saved.\n\n{v}\n\nFix the cause, then press 'Complete' to retry.",
+    },
+    "reseal.save_failed_retry": {
+        "ko": "저장되지 않았습니다 — '완료'를 눌러 다시 시도하세요.",
+        "en": "Not saved — press 'Complete' to retry.",
     },
 
     # Reseal encryption status
@@ -712,30 +793,106 @@ _TRANSLATIONS = {
     "reseal.record_info_type": {"ko": "  유형: {v}", "en": "  Type: {v}"},
     "reseal.record_info_case": {"ko": "  사건번호: {v}", "en": "  Case No.: {v}"},
     "reseal.record_info_created": {"ko": "  생성일: {v}", "en": "  Created: {v}"},
+    "reseal.record_info_mode": {"ko": "  봉인 모드: {v}", "en": "  Seal mode: {v}"},
+    "reseal.mode_unverified": {
+        "ko": "  주의: 이 모드는 불러온 파일에만 근거합니다 (서명된 정책도, 이 PC에 저장된 기록도 없음). 원래 봉인의 모드를 확인한 뒤 진행하세요.",
+        "en": "  Caution: this mode rests on the loaded file only (no signed policy, no record stored on this PC). Confirm the original seal's mode before continuing.",
+    },
+    "nav.busy_title": {"ko": "처리 진행 중", "en": "Processing"},
+    "nav.busy_msg": {
+        "ko": "봉인·재봉인 처리(암호화·기록 생성·서명·키 분할·저장)가 진행 중입니다. 완료된 뒤 이동하거나 종료하세요.",
+        "en": "Sealing or resealing (encryption, record, signature, key split, save) is in progress. Wait until it completes before leaving or closing.",
+    },
+    "nav.unsaved_title": {"ko": "키 조각 미저장", "en": "Shares Not Saved"},
+    "nav.unsaved_msg": {
+        "ko": "키 조각 1·2를 아직 파일로 저장하지 않았습니다. 지금 나가면 이 조각을 다시 만들 수 없습니다. strict 봉인은 피압수자 조각 없이 누구도 열 수 없게 됩니다.\n\n그래도 나가시겠습니까?",
+        "en": "Shares 1 and 2 have not been saved to files. If you leave now they cannot be made again, and a strict seal can then never be opened.\n\nLeave anyway?",
+    },
 
-    # Seal signature process messages
+    "nav.unrecorded_title": {"ko": "재봉인 기록 미저장", "en": "Reseal Not Recorded"},
+    "nav.unrecorded_msg": {
+        "ko": "키 조각 1·2는 파일로 저장했지만 재봉인 기록은 아직 이 PC의 DB에 저장되지 않았습니다(R8). 지금 나가면 DB에는 이전 기록만 남고 새 키 조각 3·4는 저장되지 않습니다. 새로 암호화한 파일은 키 조각 1과 2를 함께 써야만 열 수 있습니다.\n\n그래도 나가시겠습니까?",
+        "en": "Shares 1 and 2 are saved to files, but the reseal record is not yet saved in this PC's database (R8). If you leave now, the database keeps only the previous record and the new shares 3 and 4 are not stored; the newly encrypted files can then be opened only with shares 1 and 2 together.\n\nLeave anyway?",
+    },
+
+    # Seal process messages (S4-S7 run through SealProcess at S5)
     "seal.sig_process_start": {"ko": "전자서명 프로세스 시작...", "en": "Digital signature process starting..."},
-    "seal.sig_no_process": {"ko": "SealProcess 없음 — 간이 서명 수행", "en": "SealProcess unavailable — performing simple signature"},
     "seal.sig_process_done": {"ko": "전자서명 프로세스 완료!", "en": "Digital signature process complete!"},
-    "seal.sig_error_continue": {"ko": "전자서명 오류 (계속 진행 가능): {v}", "en": "Signature error (can continue): {v}"},
-    "seal.record_json_saved": {"ko": "봉인 기록 JSON 저장 완료", "en": "Seal record JSON saved"},
+    "seal.s5_running": {
+        "ko": "봉인 처리 중 (기록 생성·정책 서명·전자서명·시점확인·키 분할·저장)...",
+        "en": "Sealing (record, policy signature, PAdES signature, timestamp, key split, save)...",
+    },
+    "seal.run_s4": {"ko": "S4 봉인지 생성 및 정책 서명", "en": "S4 Building the seal record and signing the policy"},
+    "seal.run_s5": {"ko": "S5 전자서명 및 시점확인", "en": "S5 Digital signature and timestamp"},
+    "seal.run_s6": {"ko": "S6 키 분할 및 기관 조각 보호", "en": "S6 Key split and protection of the institutional shares"},
+    "seal.run_s7": {"ko": "S7 봉인 기록 저장", "en": "S7 Saving the seal record"},
+    "seal.s5_msg_credentials": {"ko": "서명용 인증서 준비", "en": "Preparing signing credentials"},
+    "seal.s5_msg_tsa_ready": {"ko": "시점확인(TSA) 서버 준비 완료", "en": "Timestamp (TSA) server ready"},
+    "seal.s5_msg_record_json": {"ko": "봉인 기록 JSON 저장", "en": "Writing the seal record JSON"},
+    "seal.s5_msg_rendering": {"ko": "봉인지 PDF 생성", "en": "Rendering the seal record PDF"},
+    "seal.s5_msg_signing": {"ko": "PAdES 전자서명 적용", "en": "Applying the PAdES signature"},
+    "seal.s5_msg_signed": {"ko": "PDF 전자서명 완료", "en": "PDF signed"},
+    "seal.s5_msg_tsa_request": {"ko": "RFC 3161 시점확인 요청", "en": "Requesting an RFC 3161 timestamp"},
+    "seal.s5_msg_tsa_verified": {"ko": "RFC 3161 시점확인 검증 완료", "en": "RFC 3161 timestamp verified"},
+    "seal.s5_msg_done": {"ko": "S5 완료", "en": "S5 complete"},
     "seal.pdf_rendered": {"ko": "PDF 렌더링 완료", "en": "PDF rendering complete"},
-    "seal.pdf_fallback": {"ko": "PDF 렌더링 폴백: {v}", "en": "PDF rendering fallback: {v}"},
     "seal.rsa_keygen": {"ko": "RSA-2048 키쌍 생성 완료", "en": "RSA-2048 key pair generated"},
     "seal.x509_cert": {"ko": "X.509 인증서 생성 완료", "en": "X.509 certificate generated"},
     "seal.cert_saved": {"ko": "인증서/개인키 저장 완료", "en": "Certificate/private key saved"},
-    "seal.cert_error": {"ko": "인증서 생성 오류 (계속 진행): {v}", "en": "Certificate error (continuing): {v}"},
+    "seal.failed_title": {"ko": "봉인 실패", "en": "Sealing Failed"},
+    "seal.failed_msg": {
+        "ko": "{step} 단계에서 봉인이 중단되었습니다. 전자서명·시점확인을 갖추지 못한 봉인지는 만들지 않습니다.\n\n{v}\n\n원인을 해결한 뒤 '다음'을 눌러 다시 시도하세요.",
+        "en": "Sealing stopped at step {step}. No seal record is produced without its signature and timestamp.\n\n{v}\n\nFix the cause, then press 'Next' to retry.",
+    },
+    "seal.failed_status": {"ko": "봉인 중단 ({step}): {v}", "en": "Sealing stopped ({step}): {v}"},
+    "seal.failed_retry": {"ko": "봉인이 완료되지 않았습니다 — '다음'을 눌러 다시 시도하세요.", "en": "Sealing did not complete — press 'Next' to retry."},
     "seal.participation": {"ko": "참여", "en": "Participated"},
+    "seal.device_user": {"ko": "기기 사용자", "en": "Device User"},
+    "seal.storage_type": {"ko": "저장매체 종류", "en": "Storage Type"},
+
+    # Seal mode (standard default / strict with consent)
+    "mode.section_title": {"ko": "봉인 모드 및 열람 제한", "en": "Seal Mode and Access Restriction"},
+    "mode.label": {"ko": "봉인 모드", "en": "Seal mode"},
+    "mode.standard": {"ko": "standard (기본값, SSS 2-of-4)", "en": "standard (default, SSS 2-of-4)"},
+    "mode.strict": {"ko": "strict (피압수자 조각 필수)", "en": "strict (subject share required)"},
+    "mode.strict_warning": {
+        "ko": "strict 모드에서는 피압수자 조각(s1)이 없으면 어떤 경우에도 키를 복구할 수 없습니다. 피압수자가 조각을 보관·제출하지 않으면 증거를 열 수 없게 됩니다.",
+        "en": "In strict mode the key cannot be recovered in any case without the subject's share (s1). If the subject does not keep and submit the share, the evidence cannot be opened.",
+    },
+    "mode.strict_consent": {
+        "ko": "위 경고를 확인했으며 strict 모드로 봉인하는 데 동의합니다.",
+        "en": "I have read the warning above and agree to seal in strict mode.",
+    },
+    "mode.shares_standard": {
+        "ko": "네 조각(s1~s4) 중 아무 두 조각 (SSS 2-of-4)",
+        "en": "any two of the four shares s1-s4 (SSS 2-of-4)",
+    },
+    "mode.shares_strict": {
+        "ko": "피압수자 조각(s1) + 기관 조각 하나(s2, s3 또는 s4) — s1 없이는 복구 불가",
+        "en": "the subject's share (s1) plus one institutional share (s2, s3 or s4) — no recovery without s1",
+    },
+    "mode.legacy": {
+        "ko": "standard (기록에 모드 항목 없음 — 이전 형식)",
+        "en": "standard (no mode field in the record — legacy format)",
+    },
+    "mode.problem": {"ko": "확인 불가 — 기록 오류: {v}", "en": "Cannot be determined — record error: {v}"},
+    "mode.kept": {"ko": "{v} — 이전 기록의 모드를 그대로 유지합니다", "en": "{v} — kept from the previous record"},
+    "keysplit.complete_strict": {
+        "ko": "키 분할 완료 (strict: s1 + 기관 조각 하나)",
+        "en": "Key Split Complete (strict: s1 + one institutional share)",
+    },
+    "keysplit.unlock_signed": {"ko": "  unlock_time (서명된 기록): {v}", "en": "  unlock_time (signed record): {v}"},
+    "keysplit.recovery": {"ko": "  복구에 필요한 조각: {v}", "en": "  Shares needed for recovery: {v}"},
 
     # Reseal unlock_time
     "reseal.unlock_days": {"ko": "일 ({min}~{max})", "en": "days ({min}~{max})"},
 
     # About dialog
     "about.title": {"ko": "정보", "en": "About"},
-    "about.version": {"ko": "v0.2.0", "en": "v0.2.0"},
+    "about.version": {"ko": "v1.1.0", "en": "v1.1.0"},
     "about.desc": {
-        "ko": "디지털증거 전자봉인시스템\nv0.2.0\n\n형사절차에서 디지털증거 봉인 모델\n(박희원, 성균관대 2025)",
-        "en": "Electronic Sealing Scheme (SSS)\nv1.0.0\n\nResearch prototype for digital evidence",
+        "ko": "디지털증거 전자봉인시스템\nv1.1.0\n\n형사절차에서 디지털증거 봉인 모델\n(박희원, 성균관대 2025)",
+        "en": "Electronic Sealing Scheme (SSS)\nv1.1.0\n\nResearch prototype for digital evidence",
     },
 
     # Exit dialog
@@ -787,6 +944,22 @@ _TRANSLATIONS = {
     "validate.select_file": {
         "ko": "대상 파일을 선택해주세요.",
         "en": "Please select a target file.",
+    },
+    "validate.strict_consent": {
+        "ko": "strict 모드를 선택하려면 경고를 확인하고 동의란에 체크해야 합니다.",
+        "en": "To seal in strict mode, read the warning and tick the consent box.",
+    },
+    "validate.strict_needs_policy": {
+        "ko": "strict 모드는 기관 봉인 정책 키가 설정된 경우에만 사용할 수 있습니다 (ENC_ENVELOPE_POLICY_KEY_PATH / ENC_ENVELOPE_POLICY_CERT_PATH).",
+        "en": "Strict mode needs the institutional seal-policy key (ENC_ENVELOPE_POLICY_KEY_PATH / ENC_ENVELOPE_POLICY_CERT_PATH).",
+    },
+    "validate.seizure_datetime": {
+        "ko": "압수일시는 YYYY-MM-DD HH:MM (UTC) 형식으로 입력해주세요.",
+        "en": "Enter the seizure date as YYYY-MM-DD HH:MM (UTC).",
+    },
+    "validate.legacy_case_id": {
+        "ko": "이 사건은 이전 형식의 ID({v})로 등록되어 봉인할 수 없습니다. 케이스 관리에서 새 사건을 등록하거나 [봉인] 메뉴에서 봉인하세요.",
+        "en": "This case was registered with a legacy ID ({v}) and cannot be sealed. Register a new case in the case manager, or seal from the Seal menu.",
     },
     "validate.select_output": {
         "ko": "출력 폴더를 선택해주세요.",
@@ -900,6 +1073,7 @@ _TRANSLATIONS = {
     "filedialog.json_files": {"ko": "JSON 파일", "en": "JSON Files"},
     "filedialog.enc_files": {"ko": "암호화 파일", "en": "Encrypted Files"},
     "filedialog.key_files": {"ko": "키 파일", "en": "Key Files"},
+    "filedialog.share_files": {"ko": "키 조각 파일", "en": "Share Files"},
     "filedialog.text_files": {"ko": "텍스트 파일", "en": "Text Files"},
     "filedialog.key_file_title": {"ko": "키 파일 선택", "en": "Select Key File"},
 
@@ -1007,6 +1181,22 @@ _TRANSLATIONS = {
     "summary.elapsed": {"ko": "소요 시간", "en": "Elapsed"},
     "summary.unlock_time": {"ko": "unlock_time", "en": "unlock_time"},
     "summary.key_shares": {"ko": "키 조각", "en": "Key Shares"},
+    "summary.key_shares_standard": {"ko": "4개 (SSS 2-of-4)", "en": "4 (SSS 2-of-4)"},
+    "summary.key_shares_strict": {"ko": "4개 (strict: s1 + 기관 조각 하나)", "en": "4 (strict: s1 + one institutional share)"},
+    "summary.seal_mode": {"ko": "봉인 모드", "en": "Seal mode"},
+    "summary.recovery_shares": {"ko": "복구에 필요한 조각", "en": "Shares needed for recovery"},
+    "summary.unlock_days": {"ko": "열람 제한 기간", "en": "Access restriction"},
+    "summary.unlock_days_value": {"ko": "{v}일 (봉인 시점부터)", "en": "{v} days (from sealing)"},
+    "summary.policy": {"ko": "봉인 정책 서명", "en": "Seal policy signature"},
+    "summary.policy_signed": {"ko": "서명됨 (기관 정책 키)", "en": "Signed (institutional policy key)"},
+    "summary.policy_absent": {
+        "ko": "없음 — 정책 키 미설정 (이전 형식 기록, 시간 잠금 해제 불가)",
+        "en": "None — no policy key configured (legacy record; the time-locked release refuses it)",
+    },
+    "summary.signed_pdf": {"ko": "서명된 봉인지 PDF", "en": "Signed seal record PDF"},
+    "summary.share1_file": {"ko": "키 조각 1 파일 (피압수자)", "en": "Share 1 file (subject)"},
+    "summary.share2_file": {"ko": "키 조각 2 파일 (수사관)", "en": "Share 2 file (investigator)"},
+    "summary.case_seal_id": {"ko": "등록된 Seal ID", "en": "Registered Seal ID"},
     "summary.reason": {"ko": "사유", "en": "Reason"},
     "summary.participated": {"ko": "피압수자 참여", "en": "Subject Participation"},
     "summary.output_file": {"ko": "출력 파일", "en": "Output File"},

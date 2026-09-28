@@ -18,7 +18,11 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
+
+# Written inside a save's transaction, on its connection (for example the
+# sync outbox rows of the saved event, stage E E2d).
+ExtraWrites = Callable[[sqlite3.Connection], None]
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +143,9 @@ def save_seal_record(
     seal_id: str,
     record_json: str,
     pdf_path: str,
+    *,
+    require_lineage: bool = False,
+    extra_writes: Optional[ExtraWrites] = None,
 ) -> None:
     """Save a seal record (JSON + PDF path).
 
@@ -147,6 +154,14 @@ def save_seal_record(
         seal_id: The seal identifier.
         record_json: JSON-serialized seal record.
         pdf_path: Absolute path to the generated PDF file.
+        require_lineage: Apply :func:`save_seal_bundle`'s replacement rule
+            inside the write transaction (``BEGIN IMMEDIATE``); U7 since
+            stage E, E2e. Raises ``SealIdConflictError`` (another seal, an
+            unclaimed placeholder) or ``StaleRecordError`` (an older
+            record of the same seal).
+        extra_writes: Called with the connection after the record is
+            written, in the same transaction (U7 writes its sync outbox rows
+            here); an exception rolls the record back too.
     """
     if not seal_id:
         raise ValueError("seal_id는 비어 있을 수 없습니다.")
@@ -155,11 +170,14 @@ def save_seal_record(
 
     # Validate JSON structure
     try:
-        json.loads(record_json)
+        record = json.loads(record_json)
     except json.JSONDecodeError as exc:
         raise ValueError(f"유효하지 않은 JSON입니다: {exc}") from exc
 
     with _connect(db_path) as conn:
+        if require_lineage:
+            conn.execute("BEGIN IMMEDIATE")
+            _require_same_seal(conn, seal_id, record)
         conn.execute(
             """
             INSERT OR REPLACE INTO seal_records (seal_id, record_json, pdf_path)
@@ -167,6 +185,8 @@ def save_seal_record(
             """,
             (seal_id, record_json, pdf_path),
         )
+        if extra_writes is not None:
+            extra_writes(conn)
     logger.info("봉인 기록 저장: seal_id=%s", seal_id)
 
 
@@ -208,11 +228,18 @@ def save_seal_bundle(
     shares: dict[int, bytes],
     cert_pem: str = "",
     key_pem_encrypted: bytes = b"",
+    *,
+    case_meta: Optional[dict[str, str]] = None,
+    registered_case_id: Optional[str] = None,
+    extra_writes: Optional[ExtraWrites] = None,
 ) -> None:
     """Persist a seal record, key shares, and certificate atomically.
 
     All inserts run inside a single transaction so a failure in any
-    statement rolls back the whole bundle (no partial seal state).
+    statement rolls back the whole bundle (no partial seal state). The
+    transaction takes SQLite's write lock first (``BEGIN IMMEDIATE``), and
+    the same-seal check runs inside it, so no other save can write the row
+    between the check and the write (stage E, E2d; F9).
 
     Args:
         db_path: Database file path.
@@ -224,6 +251,21 @@ def save_seal_bundle(
             certificate insert is skipped.
         key_pem_encrypted: Encrypted private key bytes (required when
             ``cert_pem`` is provided).
+        case_meta: Optional searchable case columns (``case_number``,
+            ``suspect_name``, ``investigator``, ``status``) written in the
+            same transaction. ``INSERT OR REPLACE`` resets them otherwise,
+            e.g. on the row a case registration created.
+        registered_case_id: The seal_id of the registered case this bundle
+            seals (S7 of a wizard started from the case manager). Only then
+            may the case's placeholder row be filled.
+        extra_writes: Called with the connection after the bundle is
+            written, in the same transaction (S7 and R8 write their sync
+            outbox rows here); an exception rolls the bundle back too.
+
+    Raises:
+        SealIdConflictError: The row for ``seal_id`` belongs to a different
+            seal, or is the placeholder of a case this bundle does not claim
+            (see :func:`_require_same_seal`); nothing was saved.
     """
     if not seal_id:
         raise ValueError("seal_id는 비어 있을 수 없습니다.")
@@ -233,37 +275,74 @@ def save_seal_bundle(
         raise ValueError("저장할 키 조각이 없습니다.")
 
     try:
-        json.loads(record_json)
+        record = json.loads(record_json)
     except json.JSONDecodeError as exc:
         raise ValueError(f"유효하지 않은 JSON입니다: {exc}") from exc
 
     with _connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_same_seal(conn, seal_id, record,
+                           registered_case_id=registered_case_id)
+        _write_bundle_rows(conn, seal_id, record_json, pdf_path, shares,
+                           cert_pem, key_pem_encrypted)
+        if case_meta is not None:
+            _ensure_case_columns(conn, db_path)
+            _write_case_meta(conn, seal_id, case_meta)
+        if extra_writes is not None:
+            extra_writes(conn)
+    logger.info(
+        "봉인 번들 저장 완료: seal_id=%s, shares=%s, cert=%s, case_meta=%s",
+        seal_id, list(shares.keys()), bool(cert_pem), case_meta is not None,
+    )
+
+
+def _write_bundle_rows(
+    conn: sqlite3.Connection, seal_id: str, record_json: str, pdf_path: str,
+    shares: dict[int, bytes], cert_pem: str, key_pem_encrypted: bytes,
+) -> None:
+    """The record, key shares and certificate rows of a bundle."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO seal_records (seal_id, record_json, pdf_path)
+        VALUES (?, ?, ?)
+        """,
+        (seal_id, record_json, pdf_path),
+    )
+    for idx, data in shares.items():
         conn.execute(
             """
-            INSERT OR REPLACE INTO seal_records (seal_id, record_json, pdf_path)
+            INSERT OR REPLACE INTO key_shares (seal_id, share_index, share_data)
             VALUES (?, ?, ?)
             """,
-            (seal_id, record_json, pdf_path),
+            (seal_id, idx, data),
         )
-        for idx, data in shares.items():
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO key_shares (seal_id, share_index, share_data)
-                VALUES (?, ?, ?)
-                """,
-                (seal_id, idx, data),
-            )
-        if cert_pem:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO certificates (seal_id, cert_pem, key_pem_encrypted)
-                VALUES (?, ?, ?)
-                """,
-                (seal_id, cert_pem, key_pem_encrypted),
-            )
-    logger.info(
-        "봉인 번들 저장 완료: seal_id=%s, shares=%s, cert=%s",
-        seal_id, list(shares.keys()), bool(cert_pem),
+    if cert_pem:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO certificates (seal_id, cert_pem, key_pem_encrypted)
+            VALUES (?, ?, ?)
+            """,
+            (seal_id, cert_pem, key_pem_encrypted),
+        )
+
+
+def _write_case_meta(
+    conn: sqlite3.Connection, seal_id: str, case_meta: dict[str, str]
+) -> None:
+    """The searchable case columns of the seal's row."""
+    conn.execute(
+        """
+        UPDATE seal_records
+        SET case_number = ?, suspect_name = ?, investigator = ?, status = ?
+        WHERE seal_id = ?
+        """,
+        (
+            case_meta.get("case_number", ""),
+            case_meta.get("suspect_name", ""),
+            case_meta.get("investigator", ""),
+            case_meta.get("status", ""),
+            seal_id,
+        ),
     )
 
 
@@ -618,6 +697,151 @@ def update_case_meta(
     logger.info("케이스 메타 업데이트: seal_id=%s", seal_id)
 
 
+# ---------------------------------------------------------------------------
+# seal_id ownership (stage E, E1 fix round: Codex F9)
+# ---------------------------------------------------------------------------
+
+# ``S-YYYYMMDD-XXXXXX`` (portal contract) has 24 random bits per day, so an
+# ID is drawn again when the drawn one is taken, this many times at most.
+_SEAL_ID_ATTEMPTS = 8
+
+
+class SealIdConflictError(ValueError):
+    """The seal_id belongs to a different seal; nothing was saved."""
+
+
+class StaleRecordError(SealIdConflictError):
+    """The same seal, but the stored record has events the new one lacks.
+
+    The new record was built from an older record of the seal (for example
+    a second unsealing from the sealing record); nothing was saved.
+    """
+
+
+def seal_id_in_use(db_path: str, seal_id: str) -> bool:
+    """Whether ``db_path`` has a row for ``seal_id``.
+
+    A database file or table that does not exist yet has no rows; the file
+    is not created by asking.
+    """
+    if not db_path or not os.path.exists(db_path):
+        return False
+    with _connect(db_path) as conn:
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM seal_records WHERE seal_id = ?", (seal_id,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return False
+            raise
+    return row is not None
+
+
+def unused_seal_id(db_path: str) -> str:
+    """A new record-format seal_id with no row in ``db_path`` yet.
+
+    For sealing without a registered case, where S4 fixes the ID long
+    before S7 stores the row; :func:`save_seal_bundle` still refuses to
+    replace another seal's row should the ID be taken in between.
+
+    Raises:
+        SealIdConflictError: Every draw was taken.
+    """
+    from ..record.record_builder import create_seal_id
+
+    for _attempt in range(_SEAL_ID_ATTEMPTS):
+        seal_id = create_seal_id()
+        if not seal_id_in_use(db_path, seal_id):
+            return seal_id
+        logger.warning("seal_id 충돌: %s 사용 중, 새로 생성합니다", seal_id)
+    raise SealIdConflictError(
+        f"사용하지 않은 seal_id를 {_SEAL_ID_ATTEMPTS}회 안에 만들지 못했습니다."
+    )
+
+
+def _require_same_seal(
+    conn: sqlite3.Connection, seal_id: str, record: object, *,
+    registered_case_id: Optional[str] = None,
+) -> None:
+    """Refuse to replace the row of a different seal that has ``seal_id``.
+
+    The row may be replaced when it does not exist; when it is the
+    placeholder a case registration wrote (no PDF, no history) and the
+    bundle claims that registration (``registered_case_id == seal_id``);
+    or when its history events are the first events of ``record``
+    unchanged: the same seal, unsealed or resealed since (history events
+    are only ever appended). An unreadable stored row is never replaced.
+    Run it inside the write transaction (``BEGIN IMMEDIATE``) so that
+    nothing can write the row between this check and the caller's write.
+
+    Raises:
+        StaleRecordError: The first events agree (the same seal) but the
+            stored record has events ``record`` lacks: ``record`` was built
+            from an older record of the seal (stage E, E2e).
+        SealIdConflictError: Otherwise.
+    """
+    row = conn.execute(
+        "SELECT record_json, pdf_path FROM seal_records WHERE seal_id = ?",
+        (seal_id,),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        stored = json.loads(row["record_json"])
+    except (json.JSONDecodeError, TypeError):
+        stored = None
+    if _is_registration_placeholder(stored, row["pdf_path"]):
+        if registered_case_id == seal_id:
+            return
+        logger.warning("seal_id %s: 등록된 다른 사건의 자리를 채우지 않았습니다",
+                       seal_id)
+        raise SealIdConflictError(
+            f"seal_id {seal_id}는 이 PC에 등록된 다른 사건이 쓰고 있습니다. "
+            "그 사건의 자리를 채우지 않았습니다.")
+    stored_events = _history_events(stored)
+    new_events = _history_events(record) or []
+    if stored_events is not None and new_events[: len(stored_events)] == stored_events:
+        return
+    raise _replacement_refused(seal_id, stored_events, new_events)
+
+
+def _replacement_refused(
+    seal_id: str, stored_events: Optional[list], new_events: list,
+) -> SealIdConflictError:
+    """The (logged) error for a stored row the new record may not replace."""
+    if stored_events and new_events and stored_events[0] == new_events[0]:
+        logger.warning("seal_id %s: 저장된 기록보다 이전 기록에서 만든 기록이라 "
+                       "저장하지 않았습니다", seal_id)
+        return StaleRecordError(
+            f"seal_id {seal_id}: 이 PC에 저장된 이 봉인의 최신 기록에 새 기록에 "
+            f"없는 이벤트가 있습니다 (저장된 이력 {len(stored_events)}건). 이전 "
+            "기록지로 작업한 것으로 보여 저장하지 않았습니다. 이 봉인의 마지막 "
+            "작업에서 만든 기록지로 다시 진행하세요.")
+    logger.warning("seal_id %s: 다른 봉인의 기록을 대체하지 않았습니다", seal_id)
+    return SealIdConflictError(
+        f"seal_id {seal_id}는 이 PC에 저장된 다른 봉인 기록이 쓰고 있습니다 "
+        "(이력 불일치). 기존 기록을 대체하지 않았습니다."
+    )
+
+
+def _is_registration_placeholder(stored: object, pdf_path: object) -> bool:
+    """The row :func:`create_case` writes: no PDF path and no history."""
+    return (isinstance(stored, dict) and "history" not in stored
+            and not pdf_path)
+
+
+def _history_events(record: object) -> Optional[list]:
+    """History events of a parsed record; [] without history; None if malformed."""
+    if not isinstance(record, dict):
+        return None
+    history = record.get("history")
+    if history is None:
+        return []
+    events = history.get("events", []) if isinstance(history, dict) else None
+    return events if isinstance(events, list) else None
+
+
 def create_case(
     db_path: str,
     case_number: str,
@@ -627,16 +851,22 @@ def create_case(
     """Create a new case (before sealing). Generates and returns a seal_id.
 
     Inserts a row into seal_records with empty record_json and pdf_path
-    so the case appears in the case list immediately.
+    so the case appears in the case list immediately. The seal_id has the
+    record format (``S-YYYYMMDD-XXXXXX``) because the sealing process
+    writes it into the record, whose schema requires that format. A drawn
+    ID that is taken is drawn again inside the same transaction; an
+    existing row is never replaced.
+
+    Raises:
+        SealIdConflictError: Every draw was taken.
     """
-    import uuid
+    from ..record.record_builder import create_seal_id
 
     if not case_number:
         raise ValueError("case_number는 비어 있을 수 없습니다.")
     if not investigator:
         raise ValueError("investigator는 비어 있을 수 없습니다.")
 
-    seal_id = f"SEAL-{uuid.uuid4().hex[:12].upper()}"
     empty_record = json.dumps({
         "case_info": {
             "case_number": case_number,
@@ -647,14 +877,26 @@ def create_case(
 
     with _connect(db_path) as conn:
         _ensure_case_columns(conn, db_path)
-        conn.execute(
-            """
-            INSERT INTO seal_records
-                (seal_id, record_json, pdf_path, case_number, suspect_name, investigator, status)
-            VALUES (?, ?, '', ?, ?, ?, '')
-            """,
-            (seal_id, empty_record, case_number, suspect_name, investigator),
-        )
+        for _attempt in range(_SEAL_ID_ATTEMPTS):
+            seal_id = create_seal_id()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO seal_records
+                        (seal_id, record_json, pdf_path, case_number, suspect_name,
+                         investigator, status)
+                    VALUES (?, ?, '', ?, ?, ?, '')
+                    """,
+                    (seal_id, empty_record, case_number, suspect_name, investigator),
+                )
+            except sqlite3.IntegrityError:  # the primary key: seal_id taken
+                logger.warning("seal_id 충돌: %s 사용 중, 새로 생성합니다", seal_id)
+                continue
+            break
+        else:
+            raise SealIdConflictError(
+                f"사용하지 않은 seal_id를 {_SEAL_ID_ATTEMPTS}회 안에 만들지 못했습니다."
+            )
     logger.info("케이스 생성: seal_id=%s, case_number=%s", seal_id, case_number)
     return seal_id
 
@@ -734,15 +976,44 @@ def get_case_for_unseal(db_path: str, seal_id: str) -> Optional[dict]:
     # file_info.result_files fallback)
     result["enc_filepath"] = _extract_enc_filepath(record, row["pdf_path"] or "")
 
-    # Derive record JSON path from pdf_path
-    pdf_path = row["pdf_path"] or ""
-    if pdf_path:
-        json_path = str(Path(pdf_path).parent / f"{seal_id}_record.json")
-        result["record_json_path"] = json_path
-    else:
-        result["record_json_path"] = ""
+    # The record JSON of the stored record's last event, beside its PDF
+    result["record_json_path"] = _latest_record_file(
+        seal_id, record, row["pdf_path"] or "")
 
     return result
+
+
+# The record JSON each step writes beside its PDF (S5, U6 and R6).
+_RECORD_FILE_NAMES = {
+    "Sealing": "{seal_id}_record.json",
+    "Unsealing": "{seal_id}_unseal_record.json",
+    "Resealing": "{seal_id}_reseal_record.json",
+}
+
+
+def _latest_record_file(seal_id: str, record: object, pdf_path: str) -> str:
+    """The record file of the stored record's last event, beside its PDF.
+
+    Stage E, E2f: before, the sealing record's name was always proposed,
+    so after an unsealing the case manager's unseal and reseal prefills
+    proposed the sealing record (or a file that does not exist). An
+    unknown step keeps the sealing name.
+    """
+    if not pdf_path:
+        return ""
+    template = _RECORD_FILE_NAMES.get(_last_step(record) or "Sealing")
+    return str(Path(pdf_path).parent / template.format(seal_id=seal_id))
+
+
+def _last_step(record: object) -> Optional[str]:
+    """The last history event's ``seal_type``, else ``process_info.type``."""
+    events = _history_events(record) or []
+    last = events[-1] if events and isinstance(events[-1], dict) else {}
+    if last.get("seal_type") in _RECORD_FILE_NAMES:
+        return last["seal_type"]
+    process_info = record.get("process_info") if isinstance(record, dict) else None
+    step = process_info.get("type") if isinstance(process_info, dict) else None
+    return step if step in _RECORD_FILE_NAMES else None
 
 
 def get_sealable_cases(db_path: str) -> list[dict]:

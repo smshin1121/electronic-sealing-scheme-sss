@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>전자봉인지</title>
+    {% if digest_keyword %}<meta name="keywords" content="{{ digest_keyword }}">{% endif %}
     <style>
         @page {
             size: A4;
@@ -121,6 +122,9 @@
             {% endfor %}
         </td>
     </tr>
+    {% if record_digest %}
+    <tr><th>봉인지 JSON 대조값 (SHA-256)</th><td style="word-break:break-all;font-family:monospace;font-size:9pt">{{ record_digest }}</td></tr>
+    {% endif %}
 </table>
 
 <!-- ===== 파일 상세 정보 ===== -->
@@ -162,6 +166,7 @@
     <tr><th>이메일</th><td>{{ record.signer_info.email }}</td></tr>
     <tr><th>생년월일</th><td>{{ record.signer_info.birth_date }}</td></tr>
     <tr><th>연락처</th><td>{{ record.signer_info.phone }}</td></tr>
+    <tr><th>인증서 지문 (SHA-256)</th><td style="word-break:break-all;font-family:monospace;font-size:9pt">{{ record.signer_info.cert_fingerprint | default('(미기록)') }}</td></tr>
 </table>
 
 <!-- ===== 봉인 이력 정보 ===== -->

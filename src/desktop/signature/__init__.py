@@ -6,6 +6,7 @@ RFC 3161 TSA client/server, and CA infrastructure.
 
 from .ca_setup import (
     create_ca,
+    issue_policy_cert,
     issue_tsa_cert,
     save_tsa_credentials,
 )
@@ -29,9 +30,19 @@ from .pdf_signer import (
 )
 from .tsa_client import (
     request_timestamp,
+    request_timestamp_trusted,
+    request_timestamp_verified_token,
     verify_timestamp,
 )
+from .tsa_profile import (
+    TsaTrustProfile,
+    is_dotted_oid,
+    load_tsa_ca_certificates,
+    verify_trusted_token,
+)
 from .tsa_server import (
+    DEFAULT_TSA_ACCURACY,
+    DEFAULT_TSA_POLICY_OID,
     create_tsa_server,
     ensure_tsa_credentials,
     ensure_tsa_server_running,
@@ -41,6 +52,7 @@ from .tsa_server import (
 from .types import (
     SignatureVerificationResult,
     TimestampVerificationResult,
+    VerifiedTimestamp,
 )
 
 __all__ = [
@@ -55,13 +67,23 @@ __all__ = [
     "create_ca",
     "issue_tsa_cert",
     "save_tsa_credentials",
+    "issue_policy_cert",
     # PDF signing
     "sign_pdf",
     "verify_pdf_signature",
     # TSA client
     "request_timestamp",
+    "request_timestamp_trusted",
+    "request_timestamp_verified_token",
     "verify_timestamp",
+    # TSA trust profile (time-locked release path)
+    "TsaTrustProfile",
+    "is_dotted_oid",
+    "load_tsa_ca_certificates",
+    "verify_trusted_token",
     # TSA server
+    "DEFAULT_TSA_ACCURACY",
+    "DEFAULT_TSA_POLICY_OID",
     "create_tsa_server",
     "ensure_tsa_credentials",
     "ensure_tsa_server_running",
@@ -70,6 +92,7 @@ __all__ = [
     # Types
     "SignatureVerificationResult",
     "TimestampVerificationResult",
+    "VerifiedTimestamp",
     # Exceptions
     "SignatureError",
     "CertificateError",

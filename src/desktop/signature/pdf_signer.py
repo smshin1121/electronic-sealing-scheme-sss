@@ -11,12 +11,20 @@ timestamp and cannot obtain one therefore must NOT silently emit a B-B
 ``tsa_url`` is supplied, timestamp failure raises and the caller decides;
 producing a timestamp-less signature requires the explicit opt-in of
 ``require_timestamp=False``, which returns a warning naming the level.
+
+The signed PDF is written to a temporary file beside the output and moved
+into place only after signing (and timestamping) succeeded, so a failed
+run leaves no output file and an earlier file at that path untouched
+(stage E, E2e: before, a TSA failure left an empty output file).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from pathlib import Path
+from typing import Any
 
 from .exceptions import PDFSigningError
 from .types import SignatureVerificationResult
@@ -125,8 +133,7 @@ def sign_pdf(
 
         with open(pdf_file, "rb") as f_in:
             writer = IncrementalPdfFileWriter(f_in)
-            with open(out_file, "wb") as f_out:
-                pdf_signer.sign_pdf(writer, output=f_out)
+            _write_signed(pdf_signer, writer, out_file)
 
         logger.info("PDF signed successfully: %s", out_file)
         return warning_msg
@@ -149,6 +156,24 @@ def sign_pdf(
                 pdf_file, cert_file, key_file, password, out_file, str(exc)
             )
         raise PDFSigningError(f"Failed to sign PDF: {exc}") from exc
+
+
+def _write_signed(pdf_signer: Any, writer: Any, out_file: Path) -> None:
+    """Sign into a temporary file beside ``out_file``, then move it there.
+
+    On any failure the temporary file is removed: no output is left, and an
+    earlier file at ``out_file`` is not touched.
+    """
+    handle, partial_name = tempfile.mkstemp(
+        dir=out_file.parent, prefix=f".{out_file.name}.", suffix=".part")
+    partial = Path(partial_name)
+    try:
+        with os.fdopen(handle, "wb") as f_out:
+            pdf_signer.sign_pdf(writer, output=f_out)
+        os.replace(partial, out_file)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def _sign_without_tsa(
@@ -182,8 +207,7 @@ def _sign_without_tsa(
         )
         with open(pdf_file, "rb") as f_in:
             writer = IncrementalPdfFileWriter(f_in)
-            with open(out_file, "wb") as f_out:
-                pdf_signer.sign_pdf(writer, output=f_out)
+            _write_signed(pdf_signer, writer, out_file)
 
         warning = (
             f"PAdES B-B (타임스탬프 없음) 수준으로 서명됨 — B-T 아님. "

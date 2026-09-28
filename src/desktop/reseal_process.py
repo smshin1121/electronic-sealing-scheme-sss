@@ -18,6 +18,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .reseal_classify import _fallback_classify
+from .seal_mode_guard import (
+    require_policy_for_strict,
+    require_safe_seal_id,
+    check_reseal_lineage,
+    resolve_reseal_mode,
+    split_mode,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,6 +73,9 @@ class ResealResult:
     key_shares: tuple[str, str, str, str]
     unlock_time_iso: str
     record_json: str
+    # Base64 envelope ciphertext of the NEW s3 bound to the new signed
+    # policy (sync field ``wrapped_s3``); None for a legacy record.
+    wrapped_s3_b64: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +89,22 @@ class ResealProcess:
     the corresponding step and returns a result dict.
     """
 
-    def __init__(self, *, db_path: str) -> None:
+    def __init__(
+        self,
+        *,
+        db_path: str,
+        policy_signer: Optional[Any] = None,
+    ) -> None:
+        """Create a resealing process.
+
+        Args:
+            db_path: Desktop SQLite database path.
+            policy_signer: Institutional seal-policy signer; when ``None``
+                it is resolved from the environment at R6 (legacy record
+                with a warning if none is configured).
+        """
         self._db_path = db_path
+        self._policy_signer = policy_signer
         self.config: Optional[ResealConfig] = None
         self.state: dict[str, Any] = {}
 
@@ -89,7 +115,15 @@ class ResealProcess:
     def run_r1_load(self, record_path: str) -> dict[str, Any]:
         """Load and validate the previous unseal record JSON.
 
-        Returns dict with keys: prev_record, seal_id.
+        The seal mode the reseal must keep is read from the record and
+        refused when unknown, when it differs from the record's signed
+        policy, or when it differs from the record this desktop stored for
+        the seal (a stripped or edited mode never downgrades strict). The
+        record must also be that stored record or a later one: its history
+        must start with the stored history (stage E, E2f), so a reseal from
+        an older record stops here, before R2 to R7 run.
+
+        Returns dict with keys: prev_record, seal_id, record_path, seal_mode.
         """
         path = Path(record_path)
         if not path.exists():
@@ -104,14 +138,21 @@ class ResealProcess:
         seal_id = prev_record.get("seal_id", "")
         if not seal_id:
             raise ValueError("기록지에 seal_id가 없습니다.")
+        # R6 builds output file names from it (no path in a seal_id).
+        require_safe_seal_id(seal_id, "기록지")
+        mode, mode_source = resolve_reseal_mode(self._db_path, prev_record)
+        check_reseal_lineage(self._db_path, prev_record)
 
         step_result = {
             "prev_record": prev_record,
             "seal_id": seal_id,
             "record_path": record_path,
+            "seal_mode": mode,
+            # What confirmed the mode: "stored", "policy", or None (file only).
+            "mode_source": mode_source,
         }
         self.state["r1"] = step_result
-        logger.info("R1 기록지 로드 완료: seal_id=%s", seal_id)
+        logger.info("R1 기록지 로드 완료: seal_id=%s mode=%s", seal_id, mode)
         return step_result
 
     # ------------------------------------------------------------------
@@ -443,6 +484,21 @@ class ResealProcess:
                 "summary": _compute_summary(new_history),
             }
 
+        # Resealing fixes a new key, unlock time and commitment, so a NEW
+        # policy is signed before the record is written and rendered. Its
+        # generation is the previous one + 1 (stage E, E2a; see
+        # desktop.policy_generation).
+        from desktop.signature.seal_policy import attach_policy_if_configured
+
+        from .policy_generation import next_policy_generation
+
+        record_dict, policy_digest = attach_policy_if_configured(
+            record_dict, self._policy_signer,
+            generation=next_policy_generation(self._db_path, prev_record),
+        )
+        # As at sealing (S4): a strict record always carries a signed policy.
+        require_policy_for_strict(record_dict, policy_digest)
+
         # Save JSON
         record_json_path = str(output_dir / f"{seal_id}_reseal_record.json")
         with open(record_json_path, "w", encoding="utf-8") as f:
@@ -469,6 +525,7 @@ class ResealProcess:
             "record_dict": record_dict,
             "record_json_path": record_json_path,
             "pdf_path": pdf_path,
+            "policy_digest": policy_digest,
         }
         self.state["r6"] = step_result
         logger.info("R6 기록 생성 완료: %s", record_json_path)
@@ -495,17 +552,21 @@ class ResealProcess:
 
         from .crypto import (
             SEAL_MODE_STRICT,
-            encrypt_envelope,
             get_master_key_path,
             recover_key_for_mode,
             split_key,
             split_key_strict,
         )
+        from .s3_wrap import wrap_institutional_shares
 
-        # Resealing honors the regime recorded at initial sealing
-        # (seal_mode is carried forward through the record chain).
-        prev_record = self.state.get("r1", {}).get("prev_record", {})
-        mode = prev_record.get("seal_mode", "standard")
+        # Resealing honors the regime recorded at initial sealing: the key
+        # is split by the mode of the R6 record (whose new policy was just
+        # signed), and that mode must be the one carried from R1. Anything
+        # unreadable or different is refused, never read as standard.
+        mode = split_mode(
+            self.state.get("r1", {}).get("prev_record", {}),
+            self.state["r6"]["record_dict"],
+        )
 
         aes_key_hex = self.state["r5"]["aes_key_hex"]
         if mode == SEAL_MODE_STRICT:
@@ -518,19 +579,20 @@ class ResealProcess:
         if recovered != aes_key_hex:
             raise RuntimeError("키 분할 검증 실패: 복원된 키가 원본과 불일치")
 
-        # Encrypt shares 3 and 4
-        master_path = get_master_key_path()
-        enc_share_3 = encrypt_envelope(shares[2].encode("utf-8"), master_path)
-        enc_share_4 = encrypt_envelope(shares[3].encode("utf-8"), master_path)
-
-        unlock_time_iso = self.state["r6"]["record_dict"].get(
-            "unlock_time_iso", ""
+        # Encrypt shares 3 and 4 (s3 bound to the new policy when signed)
+        encrypted_shares, wrapped_s3_b64 = wrap_institutional_shares(
+            shares, get_master_key_path(),
+            seal_id=self.state["r1"]["seal_id"],
+            policy_digest=self.state["r6"].get("policy_digest"),
         )
+
+        unlock_time_iso = self.state["r6"]["record_dict"].get("unlock_time_iso", "")
 
         step_result = {
             "shares": shares,
             "unlock_time_iso": unlock_time_iso,
-            "encrypted_shares": {3: enc_share_3, 4: enc_share_4},
+            "encrypted_shares": encrypted_shares,
+            "wrapped_s3_b64": wrapped_s3_b64,
         }
         self.state["r7"] = step_result
         logger.info("R7 키 분할 완료: unlock_time=%s", unlock_time_iso)
@@ -561,13 +623,16 @@ class ResealProcess:
         )
         pdf_path = self.state["r6"]["pdf_path"]
 
-        # Persist record and key shares atomically in one transaction.
+        # Persist record, key shares and the sync delivery intent
+        # atomically in one transaction (stage E, E2d).
+        intent = self._sync_intent(record_json, pdf_path)
         save_seal_bundle(
             self._db_path,
             seal_id,
             record_json,
             pdf_path,
             shares=self.state["r7"]["encrypted_shares"],
+            extra_writes=intent.write,
         )
 
         shares = self.state["r7"]["shares"]
@@ -583,10 +648,27 @@ class ResealProcess:
             key_shares=(shares[0], shares[1], shares[2], shares[3]),
             unlock_time_iso=self.state["r7"]["unlock_time_iso"],
             record_json=record_json,
+            wrapped_s3_b64=self.state["r7"].get("wrapped_s3_b64"),
         )
         self.state["r8"] = {"reseal_result": result}
         logger.info("R8 완료: seal_id=%s, 모든 기록 저장", seal_id)
+        intent.deliver()
         return result
+
+    def _sync_intent(self, record_json: str, pdf_path: str) -> Any:
+        """Stage E (E2a, E2d): the delivery intent of the record R8 saves.
+
+        Its outbox rows are written in the save's transaction; the push
+        after it never fails the reseal.
+        """
+        from .sync import prepare_sync
+
+        return prepare_sync(
+            self._db_path, event_type="Resealing", record_json=record_json,
+            pdf_path=pdf_path,
+            wrapped_s3_b64=self.state["r7"].get("wrapped_s3_b64"),
+            signer=self._policy_signer,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -599,116 +681,6 @@ def _compute_summary(history: list[dict[str, Any]]) -> str:
     unseal_count = sum(1 for e in history if e.get("event") == "unseal")
     reseal_count = sum(1 for e in history if e.get("event") == "reseal")
     return f"S{seal_count}U{unseal_count}R{reseal_count}"
-
-
-def _sha256_of_file(filepath: Path) -> str:
-    """Compute the SHA-256 hex digest of a file with 8 MiB reads."""
-    import hashlib
-
-    h = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while True:
-            chunk = f.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _suggest_category(filepath: Path, size: int) -> str:
-    """Suggest a fallback classification category for an unknown file."""
-    ext = filepath.suffix.lower()
-    if ext in (".log", ".txt"):
-        return "analysis_log"
-    if ext in (".pdf", ".docx", ".xlsx"):
-        return "report"
-    if size < 1024:
-        return "small_artifact"
-    if size > 100 * 1024 * 1024:
-        return "large_artifact"
-    return "uncategorized"
-
-
-def _fallback_classify(
-    prev_record: dict[str, Any],
-    target_dir: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Simple fallback file classification when record module is unavailable.
-
-    A hash can only match a known file when the sizes match, so files
-    whose size matches no known file are classified unknown without
-    hashing (size pre-filter). Size-matching candidates are hashed in
-    parallel (hashlib releases the GIL for large buffers).
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    # Build known hash / size sets from the previous record
-    known_hashes: set[str] = set()
-    known_sizes: set[int] = set()
-    sizes_complete = True
-
-    def _register_known(entry: dict[str, Any]) -> None:
-        nonlocal sizes_complete
-        if entry.get("sha256"):
-            known_hashes.add(entry["sha256"])
-            if isinstance(entry.get("size"), int):
-                known_sizes.add(entry["size"])
-            else:
-                # Legacy record without size: the pre-filter would
-                # misclassify, so fall back to hashing every file.
-                sizes_complete = False
-
-    _register_known(prev_record.get("original_file", {}))
-    file_info = prev_record.get("file_info", {})
-    for f in file_info.get("original_files", []):
-        _register_known(f)
-
-    known_files: list[dict[str, Any]] = []
-    unknown_files: list[dict[str, Any]] = []
-
-    target = Path(target_dir)
-    if not target.exists():
-        return known_files, unknown_files
-
-    # Single stat per file, cached alongside the path
-    candidates: list[tuple[Path, int]] = [
-        (fp, fp.stat().st_size)
-        for fp in sorted(target.rglob("*"))
-        if fp.is_file()
-    ]
-
-    # Size pre-filter: only size-matching files can be known -> hash them
-    if sizes_complete:
-        to_hash = [
-            (fp, size) for fp, size in candidates if size in known_sizes
-        ]
-    else:
-        to_hash = candidates
-
-    hashes: dict[Path, str] = {}
-    if to_hash:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            digests = pool.map(_sha256_of_file, (fp for fp, _ in to_hash))
-            hashes = {fp: digest for (fp, _), digest in zip(to_hash, digests)}
-
-    for filepath, size in candidates:
-        file_hash = hashes.get(filepath, "")
-        file_entry = {
-            "filepath": str(filepath),
-            "filename": filepath.name,
-            "size": size,
-            "sha256": file_hash,
-        }
-
-        if file_hash and file_hash in known_hashes:
-            known_files.append(file_entry)
-        else:
-            file_entry["suggested_category"] = _suggest_category(
-                filepath, size
-            )
-            unknown_files.append(file_entry)
-
-    return known_files, unknown_files
 
 
 def run_reseal_in_background(

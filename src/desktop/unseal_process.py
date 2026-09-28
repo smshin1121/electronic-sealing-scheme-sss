@@ -147,6 +147,13 @@ class UnsealProcess:
         seal_id = seal_record.get("seal_id", "")
         if not seal_id:
             raise ValueError("봉인지에 seal_id가 없습니다.")
+        # U6 builds output file names from it (no path in a seal_id).
+        from .seal_mode_guard import check_unseal_record, require_safe_seal_id
+
+        require_safe_seal_id(seal_id, "봉인지")
+        # U7 replaces the stored record that the reseal downgrade guard
+        # trusts: the mode, time lock, commitment and policy must match it.
+        check_unseal_record(self._db_path, seal_record)
 
         step_result = {
             "seal_record": seal_record,
@@ -461,17 +468,26 @@ class UnsealProcess:
                 raise RuntimeError(f"{step.upper()}가 완료되지 않았습니다.")
 
         from .db import save_seal_record
+        from .seal_mode_guard import check_unseal_save
 
         seal_id = self.state["u3"]["seal_id"]
         record_dict = self.state["u6"]["record_dict"]
         record_json = json.dumps(record_dict, ensure_ascii=False, indent=2)
         pdf_path = self.state["u6"]["pdf_path"]
 
-        save_seal_record(self._db_path, seal_id, record_json, pdf_path)
+        # Checked again right before the stored record is replaced.
+        check_unseal_save(
+            self._db_path, self.state["u3"]["seal_record"], record_dict
+        )
+        # Saved only as the stored record's continuation (checked under the
+        # write lock), with its sync delivery intent (stage E, E2d, E2e).
+        intent = self._sync_intent(record_json, pdf_path)
+        save_seal_record(self._db_path, seal_id, record_json, pdf_path,
+                         require_lineage=True, extra_writes=intent.write)
 
-        # Optional: remote upload
+        # Remote delivery of what was queued with the record
         try:
-            self._upload_record(seal_id, record_json, pdf_path)
+            self._upload_record(intent)
         except Exception as exc:
             logger.warning("원격 업로드 실패 (스킵): %s", exc)
 
@@ -488,12 +504,20 @@ class UnsealProcess:
         logger.info("U7 완료: seal_id=%s, 모든 기록 저장", seal_id)
         return result
 
-    def _upload_record(
-        self, seal_id: str, record_json: str, pdf_path: str
-    ) -> None:
-        """Upload record to the remote participation system (optional)."""
-        # Placeholder for future web integration
-        logger.info("원격 업로드 미구현 (seal_id=%s)", seal_id)
+    def _sync_intent(self, record_json: str, pdf_path: str) -> Any:
+        """Stage E (E2a, E2d): the delivery intent of the record U7 saves.
+
+        The institutional key comes from the environment (unsealing signs
+        no policy).
+        """
+        from .sync import prepare_sync
+
+        return prepare_sync(self._db_path, event_type="Unsealing",
+                            record_json=record_json, pdf_path=pdf_path)
+
+    def _upload_record(self, intent: Any) -> None:
+        """Push what was queued with the saved record; never fails U7."""
+        intent.deliver()
 
 
 def _compute_summary(history: list[dict[str, Any]]) -> str:

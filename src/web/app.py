@@ -44,6 +44,17 @@ def create_app(config_env: str | None = None) -> Flask:
     cfg = get_config(config_env)
     app.config.from_object(cfg)
 
+    # A configured but unusable release key/certificate refuses start-up.
+    from .release_config import validate_release_config
+
+    validate_release_config(app.config)
+
+    # Unset or unusable identity-protection keys refuse start-up (stage E,
+    # E3a; unset ones since the Fable gate fix for finding 5).
+    from .privacy.keys import validate_privacy_config
+
+    validate_privacy_config(app.config)
+
     # ------------------------------------------------------------------
     # CSRF protection
     # ------------------------------------------------------------------
@@ -87,6 +98,11 @@ def create_app(config_env: str | None = None) -> Flask:
 
     with app.app_context():
         init_db(app)
+        # A leftover shared ADMIN_PASSWORD, or no account able to log in,
+        # is reported at WARNING (no value is logged).
+        from .auth.admin_auth import warn_about_admin_setup
+
+        warn_about_admin_setup(app.config, os.environ)
 
     # ------------------------------------------------------------------
     # Error handlers

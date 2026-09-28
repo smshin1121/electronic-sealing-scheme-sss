@@ -142,13 +142,23 @@ def _render_html(record: dict, template_name: str) -> str:
         ) from exc
 
     try:
-        html = template.render(record=record)
+        html = template.render(record=record, **_binding_context(record, template_name))
     except Exception as exc:
         raise RenderingError(
             f"Failed to render template '{template_name}': {exc}"
         ) from exc
 
     return html
+
+
+def _binding_context(record: dict, template_name: str) -> dict:
+    """Template values that bind a sealing record to its PDF (see record_binding)."""
+    if template_name != "seal_record.html":
+        return {}
+    from .record_binding import record_digest, record_digest_keyword
+
+    digest = record_digest(record)
+    return {"record_digest": digest, "digest_keyword": record_digest_keyword(digest)}
 
 
 def _resolve_generator(template_name: str):
@@ -236,12 +246,17 @@ def _generate_pdf_reportlab(record: dict, output_path: str) -> None:
         create_styles,
         format_size,
         kv_table,
+        mono,
         p,
         section_row,
     )
+    from .record_binding import record_digest, record_digest_keyword
 
+    # The record digest goes into the document information and on the page
+    # before S5 signs the PDF (record_binding.verify_record_binding).
+    digest = record_digest(record)
     styles = create_styles()
-    doc = create_document(output_path)
+    doc = create_document(output_path, keywords=record_digest_keyword(digest))
     story: list = []
     W = doc.width
 
@@ -257,15 +272,21 @@ def _generate_pdf_reportlab(record: dict, output_path: str) -> None:
     file_list_str = "<br/>".join(
         f"&bull; {f.get('filename', '')}" for f in orig_files
     )
+    mode = record.get("seal_mode") or "standard"
     story.append(p("현재 절차 정보 (봉인)", styles.h2))
     story.append(kv_table([
         ("봉인 ID", record.get("seal_id", "")),
+        ("봉인 방식",
+         mono(mode) + (" (소유자 조각 필수)" if mode == "strict" else "")),
+        ("열람 제한 해제 시각", mono(record.get("unlock_time_iso") or "(미기록)")),
+        ("복구키 확인값 (SHA-256)", mono(record.get("key_commitment") or "(미기록)")),
         ("절차 유형", pi.get("type", "")),
         ("암호화 알고리즘", "AES-256-GCM"),
         ("암호화 시작", pi.get("start_time", "")),
         ("암호화 종료", pi.get("end_time", "")),
         ("파일 개수", str(pi.get("file_count", 0))),
         ("파일 목록", file_list_str),
+        ("봉인지 JSON 대조값 (SHA-256)", mono(digest)),
     ], W, styles))
 
     # 파일 상세 정보
@@ -303,8 +324,8 @@ def _generate_pdf_reportlab(record: dict, output_path: str) -> None:
         story.append(build_detail_table(rows_data, W))
         story.append(Spacer(1, 8))
 
-    # 서명자 정보
-    add_signer_info_section(story, record, W, styles)
+    # 서명자 정보 (with the signing certificate's fingerprint)
+    add_signer_info_section(story, record, W, styles, show_fingerprint=True)
 
     # 서명 이미지 삽입 (signature_data가 있을 때만)
     signature_data = record.get("signature_data")

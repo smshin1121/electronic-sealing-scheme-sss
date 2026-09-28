@@ -2,6 +2,8 @@
 
 OTP codes are 6-digit numeric strings valid for 5 minutes.
 In mock mode (SMTP_MOCK=true) the OTP is logged instead of emailed.
+The recipient address is never logged (stage E, E3a): it is the subject's
+decrypted e-mail.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import logging
 import secrets
 import smtplib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from email.mime.text import MIMEText
 from threading import Lock
 from typing import ClassVar
@@ -111,8 +113,7 @@ class OTPService:
 
         if self._smtp_mock:
             logger.info(
-                "[MOCK OTP] email=%s  code=%s  (유효시간: %d초)",
-                email,
+                "[MOCK OTP] code=%s  (유효시간: %d초)",
                 otp,
                 self._expiry_seconds,
             )
@@ -142,10 +143,12 @@ class OTPService:
 
             server.sendmail(self._smtp_from, [email], msg.as_string())
             server.quit()
-            logger.info("OTP sent to %s", email)
+            logger.info("OTP e-mail sent")
             return True
-        except Exception:
-            logger.exception("Failed to send OTP email to %s", email)
+        except Exception as exc:
+            # The recipient is not logged, nor the exception text, which
+            # may quote the address (SMTP errors echo the recipient).
+            logger.error("Failed to send the OTP e-mail (%s)", type(exc).__name__)
             return False
 
     # ------------------------------------------------------------------
@@ -158,12 +161,18 @@ class OTPService:
             session_id: Unique identifier for this verification attempt.
             otp: The OTP code.
         """
+        now = time.time()
         entry = _OTPEntry(
             code=otp,
-            created_at=time.time(),
+            created_at=now,
             expiry_seconds=self._expiry_seconds,
         )
         with self._lock:
+            # Codes that were never verified would otherwise stay forever.
+            expired = [key for key, old in self._store.items()
+                       if now - old.created_at > old.expiry_seconds]
+            for key in expired:
+                del self._store[key]
             self._store[session_id] = entry
 
     def verify_otp(self, session_id: str, input_otp: str) -> bool:

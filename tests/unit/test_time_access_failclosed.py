@@ -54,16 +54,26 @@ class TestVerifiedTsaPath:
     """Live round-trip against the bundled TSA server, if available."""
 
     @pytest.fixture()
-    def tsa(self):  # noqa: ANN201 — fixture shape follows test_tsa_server
+    def tsa(self, tmp_path):  # noqa: ANN201 — fixture shape follows test_tsa_server
+        # Credentials in tmp_path and an ephemeral port: never the
+        # operator's ~/.enc_envelope/tsa or the desktop program's port 3161.
         try:
             from desktop.signature import ensure_tsa_server_running
+            from desktop.signature import tsa_server
         except ImportError:
             pytest.skip("signature stack unavailable")
-        try:
-            tsa_url, tsa_cert_path = ensure_tsa_server_running()
-        except Exception as exc:  # pragma: no cover - environment guard
-            pytest.skip(f"local TSA not startable: {exc}")
-        return tsa_url, tsa_cert_path
+        tsa_url, tsa_cert_path = ensure_tsa_server_running(
+            tmp_path / "tsa", port=0
+        )
+        yield tsa_url, tsa_cert_path
+        port = int(tsa_url.rsplit(":", 1)[1].split("/", 1)[0])
+        with tsa_server._SERVER_LOCK:
+            running = tsa_server._RUNNING_SERVERS.pop(("127.0.0.1", port), None)
+        if running is not None:
+            server, thread = running
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_past_unlock_allowed_via_verified_tsa(self, tsa) -> None:
         tsa_url, tsa_cert_path = tsa
